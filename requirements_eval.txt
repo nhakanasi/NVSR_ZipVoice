@@ -5,6 +5,9 @@ numpy
 librosa
 soundfile
 
+# DNSMOS (P.835 / P.808 ONNX models)
+onnxruntime
+
 # Model
 s3prl
 pyannote.audio

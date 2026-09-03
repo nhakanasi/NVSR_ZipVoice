@@ -1190,8 +1190,12 @@ def SwooshLForward(x: Tensor):
     with torch.amp.autocast("cuda", enabled=False):
         x = x.to(torch.float32)
         x_offset = x - 4.0
-        log_sum = (1.0 + x_offset.exp()).log().to(x.dtype)
-        log_sum = torch.where(log_sum == float("inf"), x_offset, log_sum)
+        # softplus is log(1 + exp(x_offset)) evaluated stably. Computing it
+        # as (1 + x_offset.exp()).log() overflows for x_offset > ~88: the
+        # forward value can be patched up afterwards, but the backward of
+        # the exp is inf / (1 + inf) = nan, which poisons every gradient
+        # that flows back through this activation.
+        log_sum = torch.nn.functional.softplus(x_offset).to(x.dtype)
         return log_sum - 0.08 * x - 0.035
 
 
@@ -1201,8 +1205,12 @@ def SwooshRForward(x: Tensor):
     with torch.amp.autocast("cuda", enabled=False):
         x = x.to(torch.float32)
         x_offset = x - 1.0
-        log_sum = (1.0 + x_offset.exp()).log().to(x.dtype)
-        log_sum = torch.where(log_sum == float("inf"), x_offset, log_sum)
+        # softplus is log(1 + exp(x_offset)) evaluated stably. Computing it
+        # as (1 + x_offset.exp()).log() overflows for x_offset > ~88: the
+        # forward value can be patched up afterwards, but the backward of
+        # the exp is inf / (1 + inf) = nan, which poisons every gradient
+        # that flows back through this activation.
+        log_sum = torch.nn.functional.softplus(x_offset).to(x.dtype)
         return log_sum - 0.08 * x - 0.313261687
 
 

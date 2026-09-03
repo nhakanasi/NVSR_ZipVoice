@@ -465,7 +465,7 @@ def generate_sentence_raw_evaluation(
     """
 
     # Load and process prompt wav
-    prompt_wav = load_prompt_wav(prompt_wav, sampling_rate=sampling_rate)
+    prompt_wav, _ = load_prompt_wav(prompt_wav, sampling_rate=sampling_rate)
     prompt_wav, prompt_rms = rms_norm(prompt_wav, target_rms)
 
     # Extract features from prompt wav
@@ -580,7 +580,7 @@ def generate_sentence(
     """
 
     # Load and process prompt wav
-    prompt_wav = load_prompt_wav(prompt_wav, sampling_rate=sampling_rate)
+    prompt_wav, _ = load_prompt_wav(prompt_wav, sampling_rate=sampling_rate)
 
     # Remove edge and long silences in the prompt wav.
     # Add 0.2s trailing silence to avoid leaking prompt to generated speech.

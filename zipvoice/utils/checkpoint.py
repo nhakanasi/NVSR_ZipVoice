@@ -45,6 +45,7 @@ def save_checkpoint(
     scheduler: Optional[LRSchedulerType] = None,
     scaler: Optional[GradScaler] = None,
     sampler: Optional[CutSampler] = None,
+    extra_states: Optional[Dict[str, Any]] = None,
     rank: int = 0,
 ) -> None:
     """Save training information to a file.
@@ -69,6 +70,10 @@ def save_checkpoint(
       sampler:
         The sampler used in the labeled training dataset. We only
           save its `state_dict()`.
+      extra_states:
+        Any additional state dicts to store alongside the ones above, e.g. the
+        discriminators and their optimizer in an adversarial recipe. Merged
+        into the checkpoint as-is.
       rank:
         Used in DDP. We save checkpoint only for the node whose
           rank is 0.
@@ -90,6 +95,11 @@ def save_checkpoint(
         "grad_scaler": scaler.state_dict() if scaler is not None else None,
         "sampler": sampler.state_dict() if sampler is not None else None,
     }
+
+    if extra_states:
+        for k, v in extra_states.items():
+            assert k not in checkpoint, k
+            checkpoint[k] = v
 
     if model_avg is not None:
         checkpoint["model_avg"] = model_avg.to(torch.float32).state_dict()
@@ -403,6 +413,7 @@ def resume_checkpoint(
     model: nn.Module,
     model_avg: nn.Module,
     model_ema: Optional[nn.Module] = None,
+    filename: Optional[Union[str, Path]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Load checkpoint from file.
 
@@ -418,10 +429,18 @@ def resume_checkpoint(
         The return value of :func:`get_params`.
       model:
         The training model.
+      filename:
+        Resume from this checkpoint instead of the one implied by
+        `params.start_epoch`. This is how a run resumes from a mid-epoch
+        `checkpoint-{batch}.pt`, which no epoch number can name.
     Returns:
       Return a dict containing previously saved training info.
     """
-    filename = params.exp_dir / f"epoch-{params.start_epoch - 1}.pt"
+    resuming_mid_epoch = filename is not None
+    if resuming_mid_epoch:
+        filename = Path(filename)
+    else:
+        filename = params.exp_dir / f"epoch-{params.start_epoch - 1}.pt"
 
     assert filename.is_file(), f"{filename} does not exist!"
 
@@ -433,7 +452,7 @@ def resume_checkpoint(
         strict=True,
     )
 
-    if params.start_epoch > 1:
+    if params.start_epoch > 1 or resuming_mid_epoch:
         keys = [
             "best_train_epoch",
             "best_valid_epoch",
@@ -521,6 +540,7 @@ def save_checkpoint_with_global_batch_idx(
     scheduler: Optional[LRSchedulerType] = None,
     scaler: Optional[GradScaler] = None,
     sampler: Optional[CutSampler] = None,
+    extra_states: Optional[Dict[str, Any]] = None,
     rank: int = 0,
 ):
     """Save training info after processing given number of batches.
@@ -550,6 +570,9 @@ def save_checkpoint_with_global_batch_idx(
         be saved.
       sampler:
         The sampler used in the training dataset.
+      extra_states:
+        Any additional state dicts to store in the checkpoint. See
+        :func:`save_checkpoint`.
       rank:
         The rank ID used in DDP training of the current node. Set it to 0
         if DDP is not used.
@@ -566,5 +589,6 @@ def save_checkpoint_with_global_batch_idx(
         scheduler=scheduler,
         scaler=scaler,
         sampler=sampler,
+        extra_states=extra_states,
         rank=rank,
     )

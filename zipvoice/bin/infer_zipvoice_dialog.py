@@ -308,7 +308,7 @@ def generate_sentence_raw_evaluation(
 
     loaded_prompt_wavs = prompt_wav
     for i in range(len(prompt_wav)):
-        loaded_prompt_wavs[i] = load_prompt_wav(
+        loaded_prompt_wavs[i], _ = load_prompt_wav(
             loaded_prompt_wavs[i], sampling_rate=sampling_rate
         )
         if loaded_prompt_wavs[i].size(0) != 1:
@@ -458,7 +458,7 @@ def generate_sentence(
 
     loaded_prompt_wavs = prompt_wav
     for i in range(len(prompt_wav)):
-        loaded_prompt_wavs[i] = load_prompt_wav(
+        loaded_prompt_wavs[i], _ = load_prompt_wav(
             loaded_prompt_wavs[i], sampling_rate=sampling_rate
         )
         if loaded_prompt_wavs[i].size(0) != 1:
@@ -682,7 +682,7 @@ def generate_sentence_stereo_raw_evaluation(
 
     loaded_prompt_wavs = prompt_wav
     for i in range(len(prompt_wav)):
-        loaded_prompt_wavs[i] = load_prompt_wav(
+        loaded_prompt_wavs[i], _ = load_prompt_wav(
             loaded_prompt_wavs[i], sampling_rate=sampling_rate
         )
 
@@ -856,7 +856,7 @@ def generate_sentence_stereo(
 
     loaded_prompt_wavs = prompt_wav
     for i in range(len(prompt_wav)):
-        loaded_prompt_wavs[i] = load_prompt_wav(
+        loaded_prompt_wavs[i], _ = load_prompt_wav(
             loaded_prompt_wavs[i], sampling_rate=sampling_rate
         )
 

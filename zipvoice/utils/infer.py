@@ -246,8 +246,11 @@ def load_prompt_wav(prompt_wav: str, sampling_rate: int):
         sampling_rate: target sampling rate.
 
     Returns:
-        Loaded prompt waveform with target sampling rate,
-        PyTorch tensor of shape (C, T)
+        A tuple of the loaded prompt waveform at the target sampling rate, a
+        PyTorch tensor of shape (C, T), and the file's own sampling rate.
+        Resampling cannot recreate the band a lower-rate recording never had,
+        so the original rate is what tells a bandwidth-extending model how much
+        of the mel is missing.
     """
     prompt_wav, prompt_sampling_rate = torchaudio.load(prompt_wav)
 
@@ -256,7 +259,7 @@ def load_prompt_wav(prompt_wav: str, sampling_rate: int):
             orig_freq=prompt_sampling_rate, new_freq=sampling_rate
         )
         prompt_wav = resampler(prompt_wav)
-    return prompt_wav
+    return prompt_wav, prompt_sampling_rate
 
 
 def rms_norm(prompt_wav: torch.Tensor, target_rms: float):

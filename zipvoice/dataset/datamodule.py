@@ -128,6 +128,14 @@ class TtsDataModule:
             help="Whether to drop last batch. Used by sampler.",
         )
         group.add_argument(
+            "--return-audio",
+            type=str2bool,
+            default=False,
+            help="When enabled, each training batch will have the "
+            "field: batch['audio'] with the waveforms. Needed by recipes "
+            "that compute something from the waveform, e.g. F0.",
+        )
+        group.add_argument(
             "--return-cuts",
             type=str2bool,
             default=False,
@@ -172,6 +180,7 @@ class TtsDataModule:
             if self.args.on_the_fly_feats
             else PrecomputedFeatures(),
             return_cuts=self.args.return_cuts,
+            return_audio=self.args.return_audio,
         )
 
         if self.args.bucketing_sampler:

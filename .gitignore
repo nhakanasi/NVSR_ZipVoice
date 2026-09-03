@@ -193,3 +193,18 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+# Listening pack: the audio is large and the builder is a local convenience.
+egs/zipvoice/demo/
+
+# Paper sources and result write-ups: drafts, not part of the recipe.
+document/
+
+# LaTeX build artefacts
+*.aux
+*.bbl
+*.blg
+*.out
+*.synctex.gz
+*.fdb_latexmk
+*.fls
+*.toc

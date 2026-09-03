@@ -44,6 +44,8 @@ python3 -m zipvoice.bin.infer_zipvoice \
 
 `--model-name` can be `zipvoice` or `zipvoice_distill`,
     which are the models before and after distillation, respectively.
+    `zipvoice_bwe` is a locally trained model that accepts prompts at any
+    sampling rate; pass it together with `--model-dir`.
 
 Each line of `test.tsv` is in the format of
     `{wav_name}\t{prompt_transcription}\t{prompt_wav}\t{text}`.
@@ -77,6 +79,7 @@ from lhotse.utils import fix_random_seed
 from vocos import Vocos
 
 from zipvoice.models.zipvoice import ZipVoice
+from zipvoice.models.zipvoice_bwe import ZipVoiceBWE
 from zipvoice.models.zipvoice_distill import ZipVoiceDistill
 from zipvoice.tokenizer.tokenizer import (
     EmiliaTokenizer,
@@ -114,8 +117,11 @@ def get_parser():
         "--model-name",
         type=str,
         default="zipvoice",
-        choices=["zipvoice", "zipvoice_distill"],
-        help="The model used for inference",
+        choices=["zipvoice", "zipvoice_distill", "zipvoice_bwe"],
+        help="The model used for inference. zipvoice_bwe extends the prompt "
+        "mel above the prompt's own Nyquist frequency, so a prompt recorded at "
+        "any sampling rate can be used; it has no pre-trained release, so it "
+        "requires --model-dir.",
     )
 
     parser.add_argument(
@@ -290,6 +296,20 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--bwe-bypass",
+        type=str,
+        default="none",
+        choices=["none", "resunet", "full"],
+        help="Ablate the bandwidth extender of a zipvoice_bwe model. "
+        "'none' extends the prompt mel as usual. 'resunet' re-imposes the "
+        "training-time dead-band floor but does not predict into it, which "
+        "measures the ResUNet alone. 'full' leaves the prompt mel untouched, "
+        "which is the same input stock ZipVoice sees and so isolates the "
+        "extender from the fine-tuning that trained it. Ignored by other "
+        "models.",
+    )
+
+    parser.add_argument(
         "--trt-engine-path",
         type=str,
         default=None,
@@ -310,6 +330,59 @@ def get_vocoder(vocos_local_path: Optional[str] = None):
     else:
         vocoder = Vocos.from_pretrained("charactr/vocos-mel-24khz")
     return vocoder
+
+
+def extend_prompt_band(
+    model: torch.nn.Module,
+    prompt_features: torch.Tensor,
+    prompt_sampling_rate: int,
+    sampling_rate: int,
+) -> torch.Tensor:
+    """
+    Restore the mel band that a prompt recorded below `sampling_rate` never had.
+
+    Resampling a 16 kHz prompt up to 24 kHz leaves everything above 8 kHz empty,
+    which is a mel the model never saw in training. A ZipVoiceBWE fills it in;
+    any other model is left alone. ``model.bwe_bypass`` ablates the fill.
+
+    Args:
+        model: the loaded model.
+        prompt_features: the prompt mel, shape (1, T, F), already scaled by
+            feat_scale.
+        prompt_sampling_rate: the sampling rate of the prompt file itself,
+            before resampling.
+        sampling_rate: the model's sampling rate.
+
+    Returns:
+        The prompt mel, band-extended if the model supports it.
+    """
+    if not isinstance(model, ZipVoiceBWE) or model.bwe_bypass == "full":
+        return prompt_features
+
+    cutoff_hz = min(prompt_sampling_rate, sampling_rate) / 2
+    if model.bwe_bypass == "resunet":
+        logging.info(
+            f"Band-limiting the prompt mel at {cutoff_hz:.0f} Hz without "
+            f"running the extender (--bwe-bypass resunet)"
+        )
+    else:
+        logging.info(
+            f"Extending the prompt mel above {cutoff_hz:.0f} Hz "
+            f"(prompt recorded at {prompt_sampling_rate} Hz)"
+        )
+    cutoff = torch.full(
+        (prompt_features.size(0),),
+        cutoff_hz,
+        device=prompt_features.device,
+        dtype=prompt_features.dtype,
+    )
+    restored, _ = model.restore(
+        prompt_features,
+        cutoff,
+        randomize=False,
+        use_extender=model.bwe_bypass != "resunet",
+    )
+    return restored
 
 
 def generate_sentence_raw_evaluation(
@@ -365,7 +438,9 @@ def generate_sentence_raw_evaluation(
     """
 
     # Load and process prompt wav
-    prompt_wav = load_prompt_wav(prompt_wav, sampling_rate=sampling_rate)
+    prompt_wav, prompt_sampling_rate = load_prompt_wav(
+        prompt_wav, sampling_rate=sampling_rate
+    )
     prompt_wav, prompt_rms = rms_norm(prompt_wav, target_rms)
 
     # Extract features from prompt wav
@@ -374,6 +449,9 @@ def generate_sentence_raw_evaluation(
     ).to(device)
 
     prompt_features = prompt_features.unsqueeze(0) * feat_scale
+    prompt_features = extend_prompt_band(
+        model, prompt_features, prompt_sampling_rate, sampling_rate
+    )
     prompt_features_lens = torch.tensor([prompt_features.size(1)], device=device)
 
     # Convert text to tokens
@@ -494,7 +572,9 @@ def generate_sentence(
     """
 
     # Load and process prompt wav
-    prompt_wav = load_prompt_wav(prompt_wav, sampling_rate=sampling_rate)
+    prompt_wav, prompt_sampling_rate = load_prompt_wav(
+        prompt_wav, sampling_rate=sampling_rate
+    )
 
     # Remove edge and long silences in the prompt wav.
     # Add 0.2s trailing silence to avoid leaking prompt to generated speech.
@@ -523,6 +603,9 @@ def generate_sentence(
     ).to(device)
 
     prompt_features = prompt_features.unsqueeze(0) * feat_scale
+    prompt_features = extend_prompt_band(
+        model, prompt_features, prompt_sampling_rate, sampling_rate
+    )
 
     # Add punctuation in the end if there is not
     text = add_punctuation(text)
@@ -738,6 +821,10 @@ def main():
             "num_step": 8,
             "guidance_scale": 3.0,
         },
+        "zipvoice_bwe": {
+            "num_step": 16,
+            "guidance_scale": 1.0,
+        },
     }
 
     model_specific_defaults = model_defaults.get(params.model_name, {})
@@ -753,6 +840,12 @@ def main():
         "For inference, please provide prompts and text with either '--test-list'"
         " or '--prompt-wav, --prompt-text and --text'."
     )
+
+    if params.model_name == "zipvoice_bwe" and params.model_dir is None:
+        raise ValueError(
+            "zipvoice_bwe has no pre-trained release on Huggingface; train it "
+            "with zipvoice.bin.train_zipvoice_bwe and pass --model-dir."
+        )
 
     if params.model_dir is not None:
         params.model_dir = Path(params.model_dir)
@@ -801,6 +894,14 @@ def main():
             **model_config["model"],
             **tokenizer_config,
         )
+    elif params.model_name == "zipvoice_bwe":
+        model = ZipVoiceBWE(
+            **model_config["model"],
+            **model_config.get("bwe", {}),
+            **tokenizer_config,
+            feat_scale=params.feat_scale,
+            sampling_rate=model_config["feature"]["sampling_rate"],
+        )
     else:
         assert params.model_name == "zipvoice_distill"
         model = ZipVoiceDistill(
@@ -822,6 +923,14 @@ def main():
     else:
         params.device = torch.device("cpu")
     logging.info(f"Device: {params.device}")
+
+    if isinstance(model, ZipVoiceBWE):
+        model.bwe_bypass = params.bwe_bypass
+    elif params.bwe_bypass != "none":
+        logging.warning(
+            f"--bwe-bypass {params.bwe_bypass} has no effect on "
+            f"{params.model_name}, which has no bandwidth extender."
+        )
 
     model = model.to(params.device)
     model.eval()
