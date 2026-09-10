@@ -17,12 +17,11 @@
 
 """Bandwidth-robust zero-shot TTS by a ControlNet-style side branch.
 
-This is the second design in this repository for the same problem -- generate
-full-band speech from a prompt that is band-limited -- and it exists because the
-first one, :class:`~zipvoice.models.zipvoice_anyband.ZipVoiceAnyBand`, was
-measured failing in a way its structure could not be talked out of. That model
-routes a frequency-conditioning vector into the frozen backbone's residual
-stream, scaled by a learned gate. Two things went wrong.
+This is the second design for the same problem -- generate full-band speech from
+a prompt that is band-limited -- and it exists because the first one was measured
+failing in a way its structure could not be talked out of. That model routed a
+frequency-conditioning vector into the frozen backbone's residual stream, scaled
+by a learned gate. Two things went wrong.
 
 The gate never learned to close. Evaluated on the 30k checkpoint with a
 realistic prompt spectrum, ``alpha_enc`` sat at exactly its ceiling, 0.98, at
@@ -63,7 +62,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from zipvoice.models.modules.anyband import BandAdapter, FrequencyEncoder
+from zipvoice.models.modules.band_adapter import BandAdapter, FrequencyEncoder
 from zipvoice.models.modules.bwe import (
     LOG_MEL_FLOOR,
     band_limit,
@@ -103,8 +102,8 @@ class ZipVoiceAdapter(ZipVoice):
         super().__init__(**kwargs)
 
         # Degradation settings, shared verbatim with the bandwidth-extension
-        # baseline and with ZipVoiceAnyBand, so all three see the same simulated
-        # band-limiting and their numbers are comparable.
+        # baseline, so both see the same simulated band-limiting and their
+        # numbers are comparable.
         self.register_buffer(
             "mel_centers",
             mel_bin_centers(n_mels=self.feat_dim, sampling_rate=sampling_rate),
@@ -145,8 +144,6 @@ class ZipVoiceAdapter(ZipVoice):
             num_heads=freq_num_heads,
             bin_out=freq_bin_out,
             out_dim=adapter_dim,
-            ltas_channels=0,
-            use_state=False,
         )
         self.adapter = BandAdapter(
             dim=adapter_dim,
@@ -260,7 +257,7 @@ class ZipVoiceAdapter(ZipVoice):
             return_hidden=True,
         )
 
-        cond_feature = self.freq_encoder(None, speech_condition, band_mask)
+        cond_feature = self.freq_encoder(speech_condition, band_mask)
         residual = self.adapter(hidden, cond_feature, padding_mask)
         residual = residual * self._write_mask(band_mask)
         # Telemetry only; read by the training loop in place of the gate value
@@ -287,18 +284,14 @@ class ZipVoiceAdapter(ZipVoice):
         cutoff_hz: Optional[torch.Tensor] = None,
         curriculum_step: int = 0,
         curriculum_total: int = 0,
-        infill_loss_weight: float = 1.0,
-        var_loss_weight: float = 0.0,
-        need_adv: bool = False,
-        adv_t_min: float = 0.5,
+        recon_loss_weight: float = 1.0,
         **unused,
-    ) -> Tuple[
-        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[dict]
-    ]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass for training.
 
-        Two terms. The first is ZipVoice's own flow-matching loss over the
-        generated span, unchanged, which keeps the model a text-to-speech model.
+        Two terms, and only two. The first is ZipVoice's own flow-matching loss
+        over the generated span, unchanged, which keeps the model a
+        text-to-speech model.
 
         The second is a spectrogram reconstruction loss. The velocity implies an
         estimate of the endpoint, ``x1_hat = x_t + (1 - t) * v_t``, and that
@@ -316,13 +309,8 @@ class ZipVoiceAdapter(ZipVoice):
         competing hypotheses, and it is what neural vocoders and bandwidth
         extenders are trained with for the same reason.
 
-        ``var_loss_weight`` adds an optional variance-matching term on the same
-        bins, asking for the right amount of variation as well as the right
-        level. It is returned separately for logging and defaults off.
-
-        The second and third return values are the reconstruction and variance
-        terms; the training loop logs them under the names it inherited from the
-        earlier model.
+        Returns the two loss terms and the branch's residual rms, which is
+        telemetry only.
         """
         (text_condition, padding_mask,) = self.forward_text_train(
             tokens=tokens,
@@ -391,97 +379,20 @@ class ZipVoiceAdapter(ZipVoice):
         weight = valid.unsqueeze(-1).to(vt.dtype) * band_mask  # (B, T, F)
         denom = weight.sum().clamp(min=1.0)
         recon_loss = ((x1_hat - features).abs() * weight).sum() / denom
+        recon_loss = recon_loss * recon_loss_weight
 
-        var_loss = torch.zeros((), device=vt.device, dtype=vt.dtype)
-        if var_loss_weight > 0:
-            # Variance is a statistic along time, so it is measured on the prompt
-            # frames: those are the frames where a true band-limited input has an
-            # observed low band to be consistent with.
-            pw = ((~speech_condition_mask) & valid).unsqueeze(-1).to(vt.dtype)
-            n = pw.sum(dim=1).clamp(min=1.0)  # (B, 1)
-            var_pred = (
-                ((x1_hat - (x1_hat * pw).sum(1, keepdim=True) / n.unsqueeze(1)) ** 2)
-                * pw
-            ).sum(1) / n
-            var_true = (
-                (
-                    (features - (features * pw).sum(1, keepdim=True) / n.unsqueeze(1))
-                    ** 2
-                )
-                * pw
-            ).sum(1) / n
-            bw = band_mask.reshape(band_mask.size(0), -1)  # (B, F)
-            # The offset is not cosmetic: d/dx sqrt(x) is unbounded at zero and
-            # a prompt of a few frames can put a bin's variance there exactly.
-            eps = 1e-8
-            var_loss = (
-                ((var_pred.clamp(min=0) + eps).sqrt() - (var_true + eps).sqrt()) ** 2
-                * bw
-            ).sum() / bw.sum().clamp(min=1.0)
-            recon_loss = recon_loss + var_loss * var_loss_weight
-
-        recon_loss = recon_loss * infill_loss_weight
-        var_loss = var_loss.detach()
-
-        adv_ctx = None
-        if need_adv:
-            t_scalar = t.reshape(t.shape[0], -1)[:, 0]
-            adv_ctx = self._adv_context(
-                features=features,
-                xt=xt,
-                vt=vt,
-                t_scalar=t_scalar,
-                span_mask=span_mask,
-                band_mask=band_mask,
-                adv_t_min=adv_t_min,
-            )
-        # The fourth return value is the branch-strength telemetry the training
-        # loop logs; the earlier model put its gate value there.
-        return fm_loss, recon_loss, var_loss, self._residual_rms, adv_ctx
-
-    @staticmethod
-    def _adv_context(
-        features: torch.Tensor,
-        xt: torch.Tensor,
-        vt: torch.Tensor,
-        t_scalar: torch.Tensor,
-        span_mask: torch.Tensor,
-        band_mask: torch.Tensor,
-        adv_t_min: float,
-    ) -> Optional[dict]:
-        """Assemble what a mel discriminator needs from one training step.
-
-        The discriminator judges the endpoint estimate ``x_t + (1 - t) * v_t``
-        rather than the velocity, because the endpoint estimate is a mel and the
-        velocity is not. Only the generated span is shown, since the prompt
-        frames are discarded before vocoding and a discriminator that could see
-        them would win by copying; and only samples past ``adv_t_min`` take
-        part, because at low ``t`` telling the endpoint estimate from a clean mel
-        is trivial and teaches the generator nothing.
-        """
-        select = t_scalar >= adv_t_min
-        if not bool(select.any()):
-            return None
-
-        mel_hat = xt + (1.0 - t_scalar.reshape(-1, 1, 1)) * vt
-        frame_mask = span_mask.unsqueeze(-1).to(mel_hat.dtype)
-        return {
-            "real": features[select],
-            "fake": mel_hat[select],
-            "frame_mask": frame_mask[select],
-            "band_mask": band_mask[select],
-        }
+        return fm_loss, recon_loss, self._residual_rms
 
     def set_trainable(self, mode: str) -> None:
         """Select which parameters the optimiser sees.
 
-        ``anyband`` trains only the branch, leaving every released tensor absent
+        ``adapter`` trains only the branch, leaving every released tensor absent
         from the optimiser, which is what makes the result mergeable back onto
         the released checkpoint. ``decoder`` additionally releases the
         flow-matching decoder, and ``all`` releases everything; both exist to
         measure what the restraint costs.
         """
-        assert mode in ("anyband", "decoder", "all"), mode
+        assert mode in ("adapter", "decoder", "all"), mode
         if mode == "all":
             self.requires_grad_(True)
             return

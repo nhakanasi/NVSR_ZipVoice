@@ -24,8 +24,8 @@ eval_dir=${eval_dir:-${data_root}/data/bwe_eval}
 scratch=${scratch:-${data_root}/exp/rtf_scratch}
 tokenizer=${tokenizer:-emilia}
 rates=${rates:-"8000 16000 22050"}
-anyband_dir=${anyband_dir:-${data_root}/exp/zipvoice_anyband}
-anyband_ckpt=${anyband_ckpt:-iter-9000-avg-2.pt}
+adapter_dir=${adapter_dir:-${data_root}/exp/adapter}
+adapter_ckpt=${adapter_ckpt:-iter-30000-avg-2.pt}
 plugplay_dir=${plugplay_dir:-${data_root}/exp/zipvoice_bwe_plugplay_frozen}
 plugplay_ckpt=${plugplay_ckpt:-iter-30000-avg-2.pt}
 
@@ -51,11 +51,11 @@ for rate in ${rates}; do
             --num-step 16
 
       ${PY} -m zipvoice.bin.infer_zipvoice \
-            --model-name zipvoice_anyband \
-            --model-dir ${anyband_dir}/ \
-            --checkpoint-name ${anyband_ckpt} \
+            --model-name zipvoice_adapter \
+            --model-dir ${adapter_dir}/ \
+            --checkpoint-name ${adapter_ckpt} \
             --tokenizer ${tokenizer} \
             --test-list ${list} \
-            --res-dir ${scratch}/anyband_sr${rate} \
+            --res-dir ${scratch}/adapter_sr${rate} \
             --num-step 16
 done

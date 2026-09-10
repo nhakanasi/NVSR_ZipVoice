@@ -38,7 +38,6 @@ import torch
 
 from zipvoice.models.zipvoice import ZipVoice
 from zipvoice.models.zipvoice_adapter import ZipVoiceAdapter
-from zipvoice.models.zipvoice_anyband import ZipVoiceAnyBand
 from zipvoice.models.zipvoice_bwe import ZipVoiceBWE
 from zipvoice.models.zipvoice_dialog import ZipVoiceDialog, ZipVoiceDialogStereo
 from zipvoice.models.zipvoice_distill import ZipVoiceDistill
@@ -98,7 +97,6 @@ def get_parser():
             "zipvoice",
             "zipvoice_distill",
             "zipvoice_bwe",
-            "zipvoice_anyband",
             "zipvoice_adapter",
             "zipvoice_dialog",
             "zipvoice_dialog_stereo",
@@ -127,7 +125,6 @@ def main():
         "zipvoice",
         "zipvoice_distill",
         "zipvoice_bwe",
-        "zipvoice_anyband",
         "zipvoice_adapter",
     ]:
         tokenizer_config = {
@@ -162,17 +159,10 @@ def main():
             **tokenizer_config,
             sampling_rate=model_config["feature"]["sampling_rate"],
         )
-    elif params.model_name == "zipvoice_anyband":
-        model = ZipVoiceAnyBand(
-            **model_config["model"],
-            **model_config.get("anyband", {}),
-            **tokenizer_config,
-            sampling_rate=model_config["feature"]["sampling_rate"],
-        )
     elif params.model_name == "zipvoice_adapter":
         model = ZipVoiceAdapter(
             **model_config["model"],
-            **model_config.get("anyband", {}),
+            **model_config.get("adapter", {}),
             **tokenizer_config,
             sampling_rate=model_config["feature"]["sampling_rate"],
         )

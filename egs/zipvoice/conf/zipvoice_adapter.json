@@ -1,5 +1,4 @@
 {
-  "model_type" : "adapter",
   "model" : {
     "fm_decoder_downsampling_factor" : [1,2,4,2,1],
     "fm_decoder_num_layers" : [2,2,4,4,4],
@@ -20,7 +19,7 @@
     "text_embed_dim" : 192,
     "feat_dim": 100
   },
-  "anyband" : {
+  "adapter" : {
     "freq_dim" : 64,
     "freq_num_layers" : 2,
     "freq_num_heads" : 4,

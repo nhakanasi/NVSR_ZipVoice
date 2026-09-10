@@ -44,7 +44,7 @@ python3 -m zipvoice.bin.infer_zipvoice \
 
 `--model-name` can be `zipvoice` or `zipvoice_distill`,
     which are the models before and after distillation, respectively.
-    `zipvoice_bwe` and `zipvoice_anyband` are locally trained models that
+    `zipvoice_bwe` and `zipvoice_adapter` are locally trained models that
     accept prompts at any sampling rate; pass either together with
     `--model-dir`.
 
@@ -81,7 +81,6 @@ from vocos import Vocos
 
 from zipvoice.models.zipvoice import ZipVoice
 from zipvoice.models.zipvoice_adapter import ZipVoiceAdapter
-from zipvoice.models.zipvoice_anyband import ZipVoiceAnyBand
 from zipvoice.models.zipvoice_bwe import ZipVoiceBWE
 from zipvoice.models.zipvoice_distill import ZipVoiceDistill
 from zipvoice.tokenizer.tokenizer import (
@@ -124,16 +123,14 @@ def get_parser():
             "zipvoice",
             "zipvoice_distill",
             "zipvoice_bwe",
-            "zipvoice_anyband",
             "zipvoice_adapter",
         ],
         help="The model used for inference. zipvoice_bwe extends the prompt "
         "mel above the prompt's own Nyquist frequency before conditioning on "
-        "it; zipvoice_anyband instead conditions the later ODE steps on a "
-        "frequency and F0 description of the band-limited prompt and lets the "
-        "flow matching fill the band in. Either accepts a prompt recorded at "
-        "any sampling rate. Neither has a pre-trained release, so both require "
-        "--model-dir.",
+        "it; zipvoice_adapter instead leaves the backbone untouched and adds a "
+        "side branch that writes only the mel bins the prompt does not observe. "
+        "Either accepts a prompt recorded at any sampling rate. Neither has a "
+        "pre-trained release, so both require --model-dir.",
     )
 
     parser.add_argument(
@@ -405,12 +402,12 @@ def band_sample_kwargs(
     """
     Extra ``sample`` arguments describing where the prompt's band ends.
 
-    ZipVoiceAnyBand and ZipVoiceAdapter take the cutoff rather than a
-    pre-extended mel: they derive the band mask themselves, so that the branch
-    sees which bins are observed -- and, in the adapter's case, which bins it is
-    allowed to write. Every other model gets nothing extra and is unaffected.
+    ZipVoiceAdapter takes the cutoff rather than a pre-extended mel: it derives
+    the band mask itself, so that the branch sees which bins are observed and,
+    equivalently, which bins it is allowed to write. Every other model gets
+    nothing extra and is unaffected.
     """
-    if not isinstance(model, (ZipVoiceAnyBand, ZipVoiceAdapter)):
+    if not isinstance(model, ZipVoiceAdapter):
         return {}
     cutoff_hz = min(prompt_sampling_rate, sampling_rate) / 2
     logging.info(
@@ -862,10 +859,6 @@ def main():
             "num_step": 16,
             "guidance_scale": 1.0,
         },
-        "zipvoice_anyband": {
-            "num_step": 16,
-            "guidance_scale": 1.0,
-        },
         "zipvoice_adapter": {
             "num_step": 16,
             "guidance_scale": 1.0,
@@ -888,8 +881,7 @@ def main():
 
     local_only = {
         "zipvoice_bwe": "zipvoice.bin.train_zipvoice_bwe",
-        "zipvoice_anyband": "zipvoice.bin.train_zipvoice_anyband",
-        "zipvoice_adapter": "zipvoice.bin.train_zipvoice_anyband",
+        "zipvoice_adapter": "zipvoice.bin.train_zipvoice_adapter",
     }
     if params.model_name in local_only and params.model_dir is None:
         raise ValueError(
@@ -953,18 +945,10 @@ def main():
             feat_scale=params.feat_scale,
             sampling_rate=model_config["feature"]["sampling_rate"],
         )
-    elif params.model_name == "zipvoice_anyband":
-        model = ZipVoiceAnyBand(
-            **model_config["model"],
-            **model_config.get("anyband", {}),
-            **tokenizer_config,
-            feat_scale=params.feat_scale,
-            sampling_rate=model_config["feature"]["sampling_rate"],
-        )
     elif params.model_name == "zipvoice_adapter":
         model = ZipVoiceAdapter(
             **model_config["model"],
-            **model_config.get("anyband", {}),
+            **model_config.get("adapter", {}),
             **tokenizer_config,
             feat_scale=params.feat_scale,
             sampling_rate=model_config["feature"]["sampling_rate"],

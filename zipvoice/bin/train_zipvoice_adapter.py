@@ -1,63 +1,62 @@
 """
-Train ZipVoice with AnyBand-style frequency conditioning.
+Train the bandwidth-extension side branch of ZipVoiceAdapter.
 
 Stage 1 -- zero-shot text-to-speech -- is skipped: it is what the released
 ZipVoice checkpoint already is. What is trained here is stage 2, in which the
-frequency conditioning path learns to reconstruct the band a band-limited prompt
-does not have, under a flow-matching loss alone.
+side branch learns to supply the band a band-limited prompt does not have.
 
 The stage runs in two parts, and the first is the one to reach for. Stage 2a
-trains only the new modules; every released tensor has ``requires_grad`` cleared,
+trains only the branch; every released tensor has ``requires_grad`` cleared,
 which removes it from the optimiser's parameter groups entirely rather than
 merely zeroing its gradient. That distinction matters: ScaledAdam factors each
 update into a direction and a per-tensor scale, and an earlier experiment in
 this repository measured released weights being rescaled by 0.904 despite their
 gradient being zeroed throughout. A parameter the optimiser never receives
-cannot be rescaled. Together with the gate's warm-up, this makes stage 2a start
-from the released model exactly and keep every released weight bit-identical, so
-the result can be merged back onto the released checkpoint.
+cannot be rescaled. Together with the band mask that gates the branch's output,
+this makes stage 2a keep every released weight bit-identical and the full-band
+arm algebraically unchanged, so the result can be merged back onto the released
+checkpoint.
 
 Stage 2b additionally releases the flow-matching decoder at a low learning rate.
 It is the fallback, to be run only if 2a plateaus short, and it gives up the
 bit-identical property.
 
-Before either, the F0 estimator has to be trained; see
-``zipvoice/bin/train_f0_estimator.py``. Pass the result with
-``--f0-estimator-checkpoint``. It is frozen here in every stage.
+Two loss terms and no others: ZipVoice's flow-matching loss over the generated
+span, and an L1 spectrogram reconstruction loss on the endpoint estimate over
+the bins the band-limiting removed.
 
 Stage 2a:
 
-python3 -m zipvoice.bin.train_zipvoice_anyband \
+python3 -m zipvoice.bin.train_zipvoice_adapter \
     --world-size 1 \
     --use-fp16 1 \
-    --num-epochs 4 \
-    --max-duration 250 \
-    --base-lr 0.02 \
-    --anyband-trainable anyband \
-    --f0-estimator-checkpoint exp/f0_estimator/best.pt \
-    --checkpoint download/zipvoice/zipvoice.pt \
-    --model-config conf/zipvoice_anyband.json \
+    --num-iters 30000 \
+    --max-duration 72 \
+    --finetune 1 \
+    --base-lr 0.001 \
+    --adapter-trainable adapter \
+    --checkpoint download/zipvoice/model.pt \
+    --model-config conf/zipvoice_adapter.json \
     --token-file download/zipvoice/tokens.txt \
     --dataset libritts \
-    --exp-dir exp/zipvoice_anyband_stage_a
+    --exp-dir exp/adapter
 
 Stage 2b:
 
-python3 -m zipvoice.bin.train_zipvoice_anyband \
+python3 -m zipvoice.bin.train_zipvoice_adapter \
     --world-size 1 \
     --use-fp16 1 \
-    --num-epochs 2 \
-    --max-duration 250 \
-    --base-lr 0.0005 \
+    --num-iters 10000 \
+    --max-duration 72 \
     --finetune 1 \
-    --anyband-trainable decoder \
+    --base-lr 0.0005 \
+    --adapter-trainable decoder \
     --curriculum-rho 0.0 \
-    --f0-estimator-checkpoint exp/f0_estimator/best.pt \
-    --checkpoint exp/zipvoice_anyband_stage_a/epoch-4.pt \
-    --model-config conf/zipvoice_anyband.json \
+    --checkpoint exp/adapter/checkpoint-30000.pt \
+    --model-config conf/zipvoice_adapter.json \
     --token-file download/zipvoice/tokens.txt \
     --dataset libritts \
-    --exp-dir exp/zipvoice_anyband_joint
+    --exp-dir exp/adapter_joint
 """
 
 import argparse
@@ -82,14 +81,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 import zipvoice.utils.diagnostics as diagnostics
 from zipvoice.dataset.datamodule import TtsDataModule
-from zipvoice.models.modules.bwe_discriminators import (
-    BweDiscriminators,
-    feature_matching_loss,
-    hinge_d_loss,
-    hinge_g_loss,
-)
 from zipvoice.models.zipvoice_adapter import ZipVoiceAdapter
-from zipvoice.models.zipvoice_anyband import ZipVoiceAnyBand
 from zipvoice.tokenizer.tokenizer import (
     EmiliaTokenizer,
     EspeakTokenizer,
@@ -205,7 +197,7 @@ def get_parser():
     parser.add_argument(
         "--wandb-project",
         type=str,
-        default="zipvoice-anyband",
+        default="zipvoice-adapter",
         help="Weights & Biases project to log to.",
     )
 
@@ -449,122 +441,34 @@ def get_parser():
         "which is a text file with '{token}\t{token_id}' per line.",
     )
 
-    add_anyband_arguments(parser)
+    add_adapter_arguments(parser)
 
     return parser
 
 
-def add_anyband_arguments(parser: argparse.ArgumentParser) -> None:
-    """Arguments specific to the frequency conditioning path."""
+def add_adapter_arguments(parser: argparse.ArgumentParser) -> None:
+    """Arguments specific to the bandwidth-extension side branch."""
     parser.add_argument(
-        "--anyband-trainable",
+        "--adapter-trainable",
         type=str,
-        default="anyband",
-        choices=["anyband", "decoder", "all"],
-        help="Which parameters the optimiser sees. 'anyband' trains only the "
-        "new modules and leaves every released tensor bit-identical, which is "
+        default="adapter",
+        choices=["adapter", "decoder", "all"],
+        help="Which parameters the optimiser sees. 'adapter' trains only the "
+        "branch and leaves every released tensor bit-identical, which is "
         "stage 2a and the default. 'decoder' also releases the flow-matching "
         "decoder, which is stage 2b. 'all' releases everything and exists to "
         "measure what the restraint costs.",
     )
 
     parser.add_argument(
-        "--anyband-gan-start-step",
-        type=int,
-        default=-1,
-        help="Enable the discriminators once batch_idx_train reaches this "
-        "value. Negative disables adversarial training entirely, which is the "
-        "default and reproduces the non-adversarial recipe.",
-    )
-
-    parser.add_argument(
-        "--anyband-adv-loss-weight",
-        type=float,
-        default=0.1,
-        help="Weight of each discriminator's adversarial loss on the generator.",
-    )
-
-    parser.add_argument(
-        "--anyband-fmatch-loss-weight",
+        "--recon-loss-weight",
         type=float,
         default=1.0,
-        help="Weight of each discriminator's feature-matching loss.",
-    )
-
-    parser.add_argument(
-        "--anyband-disc-lr",
-        type=float,
-        default=2e-4,
-        help="Learning rate of the discriminators' AdamW optimizer.",
-    )
-
-    parser.add_argument(
-        "--anyband-adv-t-min",
-        type=float,
-        default=0.5,
-        help="Only samples whose flow-matching timestep has reached this value "
-        "take part in the adversarial terms. Below it the endpoint estimate is "
-        "still dominated by noise, so telling it from a real mel is trivial and "
-        "the generator learns nothing from losing.",
-    )
-
-    parser.add_argument(
-        "--anyband-use-harmonic-disc",
-        type=str2bool,
-        default=False,
-        help="Enable the harmonic-consistency discriminator. It needs an F0 "
-        "track and mel bin centres that this recipe does not thread through, so "
-        "it is off by default.",
-    )
-
-    parser.add_argument(
-        "--infill-loss-weight",
-        type=float,
-        default=1.0,
-        help="Weight of the high-band infilling loss over the prompt region. "
-        "This is the term that actually asks the model to predict a missing "
-        "band from an observed one; the ordinary flow-matching loss cannot, "
-        "because it excludes the prompt, which is the only region where a low "
-        "band is observed. Setting it to 0 is the ablation that isolates it.",
-    )
-
-    parser.add_argument(
-        "--f0-estimator-checkpoint",
-        type=str,
-        default=None,
-        help="Checkpoint of the mel-domain F0 and voicing estimator, from "
-        "zipvoice.bin.train_f0_estimator. Frozen in every stage. Leaving this "
-        "unset trains against an untrained estimator, which is only ever useful "
-        "as the ablation that removes the F0 conditioning.",
-    )
-
-    parser.add_argument(
-        "--gate-fixed-schedule",
-        type=str2bool,
-        default=False,
-        help="Freeze the timestep gate at its initialisation, the hand-designed "
-        "8/4/4 ramp of a 16-step solver, instead of learning it. The ablation "
-        "that says what the learned schedule is worth.",
-    )
-
-    parser.add_argument(
-        "--gate-base",
-        type=str2bool,
-        default=False,
-        help="Also weight the base text and speech conditioning by 1 - alpha as "
-        "the frequency path comes up. Off by default: downweighting the base "
-        "path removes information the frequency path cannot restore, and the "
-        "first run of this model paid away roughly half its conditioning that "
-        "way while the frequency branch was inert. Setting it to 1 restores the "
-        "original tied-gate behaviour and is the ablation for it.",
-    )
-
-    parser.add_argument(
-        "--gate-warmup-steps",
-        type=int,
-        default=2000,
-        help="Number of steps over which the gate is scaled in from zero. At "
-        "step 0 the model is the released checkpoint exactly.",
+        help="Weight of the spectrogram reconstruction loss, an L1 error on the "
+        "endpoint estimate over the bins the band-limiting removed. This is the "
+        "term that actually asks the model to invent a missing band; the "
+        "flow-matching loss on its own only asks it to stay a text-to-speech "
+        "model. Setting it to 0 is the ablation that isolates it.",
     )
 
     parser.add_argument(
@@ -604,17 +508,6 @@ def add_anyband_arguments(parser: argparse.ArgumentParser) -> None:
         help="Fraction of each batch left entirely un-band-limited, so the "
         "original full-band condition of the pretrained backbone is preserved "
         "and the gate sees band_frac=0 during training.",
-    )
-
-    parser.add_argument(
-        "--var-loss-weight",
-        type=float,
-        default=0.0,
-        help="Weight of the per-bin variance-matching term added to the "
-        "infilling loss. A squared-error term alone is minimised by the "
-        "conditional mean, which is a flatter high band than any real one; "
-        "this charges the gap between the predicted and true per-bin standard "
-        "deviation over the prompt frames on the missing bins.",
     )
 
     parser.add_argument(
@@ -675,89 +568,6 @@ def get_params() -> AttributeDict:
     return params
 
 
-def gan_enabled(params: AttributeDict) -> bool:
-    """Whether the discriminators take part at the current training step."""
-    return (
-        params.anyband_gan_start_step >= 0
-        and params.batch_idx_train >= params.anyband_gan_start_step
-    )
-
-
-def discriminator_states(
-    discriminators: Optional[Union[nn.Module, DDP]],
-    disc_optimizer: Optional[Optimizer],
-) -> Optional[dict]:
-    """The discriminator state to store in a checkpoint, so a resumed run picks
-    the adversarial game back up rather than restarting it against a generator
-    that has moved on."""
-    if discriminators is None:
-        return None
-    module = (
-        discriminators.module if isinstance(discriminators, DDP) else discriminators
-    )
-    return {
-        "discriminators": module.state_dict(),
-        "disc_optimizer": (
-            disc_optimizer.state_dict() if disc_optimizer is not None else None
-        ),
-    }
-
-
-def run_discriminators(
-    discriminators: Union[nn.Module, DDP],
-    mel: torch.Tensor,
-    band_mask: torch.Tensor,
-    frame_mask: torch.Tensor,
-) -> Tuple[dict, dict]:
-    """Run every enabled discriminator view on one mel."""
-    return discriminators(
-        mel=mel * frame_mask,
-        mask=band_mask,
-        cutoff_hz=None,
-        centers=None,
-    )
-
-
-def compute_disc_loss(
-    params: AttributeDict,
-    discriminators: Union[nn.Module, DDP],
-    adv_ctx: dict,
-    num_frames: int,
-) -> Tuple[torch.Tensor, MetricsTracker]:
-    """Hinge discriminator loss: the clean mel against the detached endpoint
-    estimate.
-
-    Real and fake go through in one batched forward. DDP's reducer tolerates
-    only a single forward per backward, and neither enabled discriminator stack
-    carries batch statistics, so batching the two together is numerically the
-    same as two separate passes.
-    """
-    real = adv_ctx["real"]
-    fake = adv_ctx["fake"].detach()
-    batch_size = real.size(0)
-
-    paired_logits, _ = run_discriminators(
-        discriminators,
-        torch.cat([real, fake], dim=0),
-        torch.cat([adv_ctx["band_mask"]] * 2, dim=0),
-        torch.cat([adv_ctx["frame_mask"]] * 2, dim=0),
-    )
-
-    # "frames" is deliberately not set here: this tracker is added to the
-    # generator's, which already carries the frame count.
-    info = MetricsTracker()
-    loss = torch.zeros((), device=real.device)
-    for view, logits in paired_logits.items():
-        view_loss = hinge_d_loss(
-            [logit[:batch_size] for logit in logits],
-            [logit[batch_size:] for logit in logits],
-        )
-        loss = loss + view_loss
-        info[f"d_{view}"] = view_loss.detach().cpu().item() * num_frames
-    info["d_loss"] = loss.detach().cpu().item() * num_frames
-    return loss, info
-
-
 def compute_fbank_loss(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
@@ -765,8 +575,7 @@ def compute_fbank_loss(
     features_lens: Tensor,
     tokens: List[List[int]],
     is_training: bool,
-    discriminators: Optional[Union[nn.Module, DDP]] = None,
-) -> Tuple[Tensor, MetricsTracker, Optional[dict]]:
+) -> Tuple[Tensor, MetricsTracker]:
     """
     Compute loss given the model and its inputs.
 
@@ -802,23 +611,11 @@ def compute_fbank_loss(
             .unsqueeze(1)
             .unsqueeze(2)
         )
-    inner = model.module if isinstance(model, DDP) else model
-    # The gate's warm-up is driven by the global step rather than by a counter of
-    # its own, so that resuming a run picks the schedule up where it left off.
-    # The adapter model has no gate to warm up; its branch is held off at full
-    # band by the band mask instead, which needs no schedule.
-    if hasattr(inner, "gate_enc"):
-        for _gate in (inner.gate_enc, inner.gate_dec):
-            _gate.step.fill_(params.batch_idx_train)
-
-    need_adv = (
-        is_training and discriminators is not None and gan_enabled(params)
-    )
     num_frames = features_lens.sum().item()
 
     with torch.set_grad_enabled(is_training):
 
-        fm_loss, infill_loss, var_loss, alpha, adv_ctx = model(
+        fm_loss, recon_loss, residual_rms = model(
             tokens=tokens,
             features=features,
             features_lens=features_lens,
@@ -827,62 +624,25 @@ def compute_fbank_loss(
             condition_drop_ratio=params.condition_drop_ratio,
             curriculum_step=params.batch_idx_train,
             curriculum_total=params.curriculum_steps,
-            infill_loss_weight=params.infill_loss_weight,
-            var_loss_weight=params.var_loss_weight,
-            need_adv=need_adv,
-            adv_t_min=params.anyband_adv_t_min,
+            recon_loss_weight=params.recon_loss_weight,
         )
-        loss = fm_loss + infill_loss
+        loss = fm_loss + recon_loss
+
+    assert loss.requires_grad == is_training
 
     info = MetricsTracker()
     info["frames"] = num_frames
     info["fm_loss"] = fm_loss.detach().cpu().item() * num_frames
-    info["infill_loss"] = infill_loss.detach().cpu().item() * num_frames
-    # Logged apart from the term it is folded into. The previous run's failure
-    # was invisible in the loss it shared with everything else, so the two
-    # halves of the infilling objective are tracked separately here: a falling
-    # squared error bought with a widening variance gap is the over-smoothing
-    # this term exists to catch, and it only shows up as two numbers.
-    info["var_loss"] = var_loss.cpu().item() * num_frames
-
-    if need_adv and adv_ctx is not None:
-        # The generator's side of the game. The discriminator's own step needs
-        # a second forward on detached inputs and happens in the training loop,
-        # because DDP allows only one forward per backward.
-        disc_module = (
-            discriminators.module
-            if isinstance(discriminators, DDP)
-            else discriminators
-        )
-        fake_logits, fake_features = run_discriminators(
-            disc_module,
-            adv_ctx["fake"],
-            adv_ctx["band_mask"],
-            adv_ctx["frame_mask"],
-        )
-        with torch.no_grad():
-            _, real_features = run_discriminators(
-                disc_module,
-                adv_ctx["real"],
-                adv_ctx["band_mask"],
-                adv_ctx["frame_mask"],
-            )
-        for view in fake_logits:
-            adv = hinge_g_loss(fake_logits[view])
-            fmatch = feature_matching_loss(real_features[view], fake_features[view])
-            loss = loss + params.anyband_adv_loss_weight * adv
-            loss = loss + params.anyband_fmatch_loss_weight * fmatch
-            info[f"adv_{view}"] = adv.detach().cpu().item() * num_frames
-            info[f"fmatch_{view}"] = fmatch.detach().cpu().item() * num_frames
-
-    assert loss.requires_grad == is_training
+    info["recon_loss"] = recon_loss.detach().cpu().item() * num_frames
     info["loss"] = loss.detach().cpu().item() * num_frames
-    # The gate is the paper's figure: logging it every step is what turns "the
-    # model decides for itself" into something that can be shown rather than
-    # asserted.
-    info["alpha"] = alpha.cpu().item() * num_frames
+    # How hard the branch is pushing. The previous design's failure was a gate
+    # pinned at its ceiling at every bandwidth, and it was invisible in a loss
+    # shared with everything else; this is the one number that would show the
+    # same thing here, so it is on the training curves rather than left to a
+    # post-hoc probe.
+    info["residual_rms"] = residual_rms.cpu().item() * num_frames
 
-    return loss, info, adv_ctx
+    return loss, info
 
 
 def train_one_epoch(
@@ -897,8 +657,6 @@ def train_one_epoch(
     tb_writer: Optional[SummaryWriter] = None,
     world_size: int = 1,
     rank: int = 0,
-    discriminators: Optional[Union[nn.Module, DDP]] = None,
-    disc_optimizer: Optional[Optimizer] = None,
 ) -> None:
     """Train the model for one epoch.
 
@@ -930,8 +688,6 @@ def train_one_epoch(
         be set to 0.
     """
     model.train()
-    if discriminators is not None:
-        discriminators.train()
     device = model.device if isinstance(model, DDP) else next(model.parameters()).device
 
     # used to track the stats over iterations in one epoch
@@ -975,8 +731,6 @@ def train_one_epoch(
                 world_size=world_size,
             )
             model.train()
-            if discriminators is not None:
-                discriminators.train()
             logging.info(
                 f"Epoch {params.cur_epoch}, global_batch_idx: {params.batch_idx_train},"
                 f" validation: {valid_info}"
@@ -1004,43 +758,18 @@ def train_one_epoch(
 
         try:
             with torch_autocast(dtype=torch.float16, enabled=params.use_fp16):
-                loss, loss_info, adv_ctx = compute_fbank_loss(
+                loss, loss_info = compute_fbank_loss(
                     params=params,
                     model=model,
                     features=features,
                     features_lens=features_lens,
                     tokens=tokens,
                     is_training=True,
-                    discriminators=discriminators,
                 )
-
-            # Discriminator step, 1:1 with the generator step. Skipped when no
-            # sample in the batch reached the adversarial timestep threshold.
-            train_disc = (
-                discriminators is not None
-                and gan_enabled(params)
-                and adv_ctx is not None
-            )
-            if train_disc:
-                with torch_autocast(dtype=torch.float16, enabled=params.use_fp16):
-                    disc_loss, disc_info = compute_disc_loss(
-                        params=params,
-                        discriminators=discriminators,
-                        adv_ctx=adv_ctx,
-                        num_frames=loss_info["frames"],
-                    )
-                loss_info = loss_info + disc_info
 
             tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
 
             scaler.scale(loss).backward()
-
-            if train_disc:
-                # The generator's adversarial term backpropagates through the
-                # discriminators and leaves gradients on their parameters.
-                # Discard those before computing the discriminators' own.
-                disc_optimizer.zero_grad()
-                scaler.scale(disc_loss).backward()
 
             scheduler.step_batch(params.batch_idx_train)
             # Use the number of hours of speech to adjust the learning rate
@@ -1052,13 +781,9 @@ def train_one_epoch(
                     / 3600
                 )
             scaler.step(optimizer)
-            if train_disc:
-                scaler.step(disc_optimizer)
             # A single update() per iteration, after every step().
             scaler.update()
             optimizer.zero_grad()
-            if train_disc:
-                disc_optimizer.zero_grad()
         except Exception as e:
             logging.info(f"Caught exception : {e}.")
             save_bad_model()
@@ -1093,7 +818,6 @@ def train_one_epoch(
                 sampler=train_dl.sampler,
                 scaler=scaler,
                 rank=rank,
-                extra_states=discriminator_states(discriminators, disc_optimizer),
             )
             remove_checkpoints(
                 out_dir=params.exp_dir,
@@ -1181,7 +905,7 @@ def compute_validation_loss(
             return_feature=True,
         )
 
-        loss, loss_info, _ = compute_fbank_loss(
+        loss, loss_info = compute_fbank_loss(
             params=params,
             model=model,
             features=features,
@@ -1258,7 +982,7 @@ def scan_pessimistic_batches_for_oom(
         try:
             with torch_autocast(dtype=torch.float16, enabled=params.use_fp16):
 
-                loss, loss_info, _ = compute_fbank_loss(
+                loss, loss_info = compute_fbank_loss(
                     params=params,
                     model=model,
                     features=features,
@@ -1350,28 +1074,10 @@ def run(rank, world_size, args):
 
     logging.info("About to create model")
 
-    # Which of the two designs the config asks for. ``adapter`` is the
-    # ControlNet-style side branch on a frozen, unperturbed backbone; the gate
-    # arguments below belong to the older conditioning path and are not passed
-    # to it, because it has no gate.
-    model_type = model_config.get("model_type", "anyband")
-    assert model_type in ("anyband", "adapter"), model_type
-    model_class = ZipVoiceAnyBand if model_type == "anyband" else ZipVoiceAdapter
-    gate_args = (
-        dict(
-            gate_fixed_schedule=params.gate_fixed_schedule,
-            gate_base=params.gate_base,
-            gate_warmup_steps=params.gate_warmup_steps,
-        )
-        if model_type == "anyband"
-        else {}
-    )
-
-    model = model_class(
+    model = ZipVoiceAdapter(
         **model_config["model"],
-        **model_config.get("anyband", {}),
+        **model_config.get("adapter", {}),
         **tokenizer_config,
-        **gate_args,
         feat_scale=params.feat_scale,
         cutoff_min=params.cutoff_min,
         cutoff_max=params.cutoff_max,
@@ -1401,32 +1107,8 @@ def run(rank, world_size, args):
             roots = sorted({name.split(".")[0] for name in missing})
             logging.info(f"Modules initialised fresh: {roots}")
 
-    if getattr(model, "f0_estimator", None) is None:
-        logging.info("F0 conditioning is off (use_f0=false); no estimator loaded.")
-    elif params.f0_estimator_checkpoint is not None:
-        logging.info(f"Loading F0 estimator from {params.f0_estimator_checkpoint}")
-        state = torch.load(params.f0_estimator_checkpoint, map_location="cpu")
-        model.f0_estimator.load_state_dict(state.get("model", state))
-    else:
-        logging.warning(
-            "No --f0-estimator-checkpoint given; the F0 conditioning is "
-            "untrained and carries no information."
-        )
-
     num_param = sum([p.numel() for p in model.parameters()])
     logging.info(f"Number of parameters : {num_param}")
-
-    discriminators: Optional[nn.Module] = None
-    if params.anyband_gan_start_step >= 0:
-        discriminators = BweDiscriminators(
-            n_mels=params.feat_dim,
-            use_harmonic=params.anyband_use_harmonic_disc,
-            **model_config.get("anyband_disc", {}),
-        )
-        logging.info(
-            "Number of discriminator parameters : "
-            f"{sum(p.numel() for p in discriminators.parameters())}"
-        )
 
     model_avg: Optional[nn.Module] = None
     if rank == 0:
@@ -1458,19 +1140,14 @@ def run(rank, world_size, args):
     # get_parameter_groups_with_lrs drops parameters whose requires_grad is
     # False -- which is what keeps ScaledAdam's per-tensor scale away from the
     # released weights.
-    model.set_trainable(params.anyband_trainable)
+    model.set_trainable(params.adapter_trainable)
     trainable = [n for n, p in model.named_parameters() if p.requires_grad]
     logging.info(
-        f"Stage '{params.anyband_trainable}': training "
+        f"Stage '{params.adapter_trainable}': training "
         f"{sum(p.numel() for p in model.parameters() if p.requires_grad)} "
         f"parameters in {len(trainable)} tensors, roots "
         f"{sorted({n.split('.')[0] for n in trainable})}"
     )
-
-    if discriminators is not None and checkpoints is not None:
-        if "discriminators" in checkpoints:
-            logging.info("Loading discriminator state dict")
-            discriminators.load_state_dict(checkpoints["discriminators"])
 
     model = model.to(params.device)
     if world_size > 1:
@@ -1486,22 +1163,6 @@ def run(rank, world_size, args):
         lr=params.base_lr,  # should have no effect
         clipping_scale=2.0,
     )
-
-    disc_optimizer: Optional[Optimizer] = None
-    if discriminators is not None:
-        discriminators = discriminators.to(params.device)
-        if world_size > 1:
-            discriminators = DDP(discriminators, device_ids=[rank])
-        # Plain AdamW rather than ScaledAdam: ScaledAdam's per-tensor scale
-        # clipping is a poor fit for a GAN discriminator.
-        disc_optimizer = torch.optim.AdamW(
-            discriminators.parameters(),
-            lr=params.anyband_disc_lr,
-            betas=(0.8, 0.99),
-        )
-        if checkpoints is not None and "disc_optimizer" in checkpoints:
-            logging.info("Loading discriminator optimizer state dict")
-            disc_optimizer.load_state_dict(checkpoints["disc_optimizer"])
 
     assert params.lr_hours >= 0
 
@@ -1647,8 +1308,6 @@ def run(rank, world_size, args):
             tb_writer=tb_writer,
             world_size=world_size,
             rank=rank,
-            discriminators=discriminators,
-            disc_optimizer=disc_optimizer,
         )
 
         if params.num_iters > 0 and params.batch_idx_train > params.num_iters:
@@ -1669,7 +1328,6 @@ def run(rank, world_size, args):
             sampler=train_dl.sampler,
             scaler=scaler,
             rank=rank,
-            extra_states=discriminator_states(discriminators, disc_optimizer),
         )
 
         if rank == 0:
