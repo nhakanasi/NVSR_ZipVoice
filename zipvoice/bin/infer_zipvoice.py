@@ -44,8 +44,9 @@ python3 -m zipvoice.bin.infer_zipvoice \
 
 `--model-name` can be `zipvoice` or `zipvoice_distill`,
     which are the models before and after distillation, respectively.
-    `zipvoice_bwe` is a locally trained model that accepts prompts at any
-    sampling rate; pass it together with `--model-dir`.
+    `zipvoice_bwe` and `zipvoice_anyband` are locally trained models that
+    accept prompts at any sampling rate; pass either together with
+    `--model-dir`.
 
 Each line of `test.tsv` is in the format of
     `{wav_name}\t{prompt_transcription}\t{prompt_wav}\t{text}`.
@@ -79,6 +80,8 @@ from lhotse.utils import fix_random_seed
 from vocos import Vocos
 
 from zipvoice.models.zipvoice import ZipVoice
+from zipvoice.models.zipvoice_adapter import ZipVoiceAdapter
+from zipvoice.models.zipvoice_anyband import ZipVoiceAnyBand
 from zipvoice.models.zipvoice_bwe import ZipVoiceBWE
 from zipvoice.models.zipvoice_distill import ZipVoiceDistill
 from zipvoice.tokenizer.tokenizer import (
@@ -117,11 +120,20 @@ def get_parser():
         "--model-name",
         type=str,
         default="zipvoice",
-        choices=["zipvoice", "zipvoice_distill", "zipvoice_bwe"],
+        choices=[
+            "zipvoice",
+            "zipvoice_distill",
+            "zipvoice_bwe",
+            "zipvoice_anyband",
+            "zipvoice_adapter",
+        ],
         help="The model used for inference. zipvoice_bwe extends the prompt "
-        "mel above the prompt's own Nyquist frequency, so a prompt recorded at "
-        "any sampling rate can be used; it has no pre-trained release, so it "
-        "requires --model-dir.",
+        "mel above the prompt's own Nyquist frequency before conditioning on "
+        "it; zipvoice_anyband instead conditions the later ODE steps on a "
+        "frequency and F0 description of the band-limited prompt and lets the "
+        "flow matching fill the band in. Either accepts a prompt recorded at "
+        "any sampling rate. Neither has a pre-trained release, so both require "
+        "--model-dir.",
     )
 
     parser.add_argument(
@@ -385,6 +397,29 @@ def extend_prompt_band(
     return restored
 
 
+def band_sample_kwargs(
+    model: torch.nn.Module,
+    prompt_sampling_rate: int,
+    sampling_rate: int,
+) -> dict:
+    """
+    Extra ``sample`` arguments describing where the prompt's band ends.
+
+    ZipVoiceAnyBand and ZipVoiceAdapter take the cutoff rather than a
+    pre-extended mel: they derive the band mask themselves, so that the branch
+    sees which bins are observed -- and, in the adapter's case, which bins it is
+    allowed to write. Every other model gets nothing extra and is unaffected.
+    """
+    if not isinstance(model, (ZipVoiceAnyBand, ZipVoiceAdapter)):
+        return {}
+    cutoff_hz = min(prompt_sampling_rate, sampling_rate) / 2
+    logging.info(
+        f"Conditioning on a prompt band-limited at {cutoff_hz:.0f} Hz "
+        f"(prompt recorded at {prompt_sampling_rate} Hz)"
+    )
+    return {"cutoff_hz": cutoff_hz}
+
+
 def generate_sentence_raw_evaluation(
     save_path: str,
     prompt_text: str,
@@ -477,6 +512,7 @@ def generate_sentence_raw_evaluation(
         duration="predict",
         num_step=num_step,
         guidance_scale=guidance_scale,
+        **band_sample_kwargs(model, prompt_sampling_rate, sampling_rate),
     )
 
     # Postprocess predicted features
@@ -659,6 +695,7 @@ def generate_sentence(
             duration="predict",
             num_step=num_step,
             guidance_scale=guidance_scale,
+            **band_sample_kwargs(model, prompt_sampling_rate, sampling_rate),
         )
 
         # Postprocess predicted features
@@ -825,6 +862,14 @@ def main():
             "num_step": 16,
             "guidance_scale": 1.0,
         },
+        "zipvoice_anyband": {
+            "num_step": 16,
+            "guidance_scale": 1.0,
+        },
+        "zipvoice_adapter": {
+            "num_step": 16,
+            "guidance_scale": 1.0,
+        },
     }
 
     model_specific_defaults = model_defaults.get(params.model_name, {})
@@ -841,10 +886,16 @@ def main():
         " or '--prompt-wav, --prompt-text and --text'."
     )
 
-    if params.model_name == "zipvoice_bwe" and params.model_dir is None:
+    local_only = {
+        "zipvoice_bwe": "zipvoice.bin.train_zipvoice_bwe",
+        "zipvoice_anyband": "zipvoice.bin.train_zipvoice_anyband",
+        "zipvoice_adapter": "zipvoice.bin.train_zipvoice_anyband",
+    }
+    if params.model_name in local_only and params.model_dir is None:
         raise ValueError(
-            "zipvoice_bwe has no pre-trained release on Huggingface; train it "
-            "with zipvoice.bin.train_zipvoice_bwe and pass --model-dir."
+            f"{params.model_name} has no pre-trained release on Huggingface; "
+            f"train it with {local_only[params.model_name]} and pass "
+            f"--model-dir."
         )
 
     if params.model_dir is not None:
@@ -898,6 +949,22 @@ def main():
         model = ZipVoiceBWE(
             **model_config["model"],
             **model_config.get("bwe", {}),
+            **tokenizer_config,
+            feat_scale=params.feat_scale,
+            sampling_rate=model_config["feature"]["sampling_rate"],
+        )
+    elif params.model_name == "zipvoice_anyband":
+        model = ZipVoiceAnyBand(
+            **model_config["model"],
+            **model_config.get("anyband", {}),
+            **tokenizer_config,
+            feat_scale=params.feat_scale,
+            sampling_rate=model_config["feature"]["sampling_rate"],
+        )
+    elif params.model_name == "zipvoice_adapter":
+        model = ZipVoiceAdapter(
+            **model_config["model"],
+            **model_config.get("anyband", {}),
             **tokenizer_config,
             feat_scale=params.feat_scale,
             sampling_rate=model_config["feature"]["sampling_rate"],

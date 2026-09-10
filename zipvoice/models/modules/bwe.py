@@ -118,6 +118,9 @@ def curriculum_lambda(step: int, total_steps: int, rho: float = 0.7) -> float:
     return (1.0 - math.cos(math.pi * progress)) / 2.0
 
 
+FULL_BAND_HZ = 1.0e6
+
+
 def sample_cutoff(
     batch_size: int,
     step: int,
@@ -126,6 +129,7 @@ def sample_cutoff(
     f_max: float = 12000.0,
     beta: float = 4.0,
     rho: float = 0.7,
+    full_band_prob: float = 0.0,
     device: torch.device = torch.device("cpu"),
 ) -> torch.Tensor:
     """
@@ -143,6 +147,16 @@ def sample_cutoff(
     Set ``rho <= 0`` (or ``total_steps <= 0``) for plain uniform sampling, which
     is what the adversarial refinement stage uses.
 
+    ``full_band_prob`` reserves that fraction of the batch for an untouched
+    full-band prompt, drawn *instead of* a curriculum sample rather than as part
+    of it. The curriculum is continuous on ``[f_min, f_max]``, so the exactly
+    full-band case has probability zero under it, and a model trained on it
+    alone never once sees the unmasked condition the released checkpoint was
+    trained for -- which is the condition every 24 kHz evaluation runs at. The
+    reserved cutoff is far above any filter center, so
+    :func:`hz_to_mel_bin` clamps it to the top bin and :func:`band_limit`
+    leaves the mel untouched.
+
     Returns:
         Cutoff frequencies in Hz, shape ``(batch_size,)``.
     """
@@ -151,7 +165,13 @@ def sample_cutoff(
     exp_branch = torch.log1p(u * math.expm1(beta)) / beta
     use_uniform = torch.rand(batch_size, device=device) < lam
     f_tilde = torch.where(use_uniform, u, exp_branch)
-    return f_min + f_tilde * (f_max - f_min)
+    cutoff = f_min + f_tilde * (f_max - f_min)
+    if full_band_prob > 0:
+        full = torch.rand(batch_size, device=device) < full_band_prob
+        cutoff = torch.where(
+            full, torch.full_like(cutoff, FULL_BAND_HZ), cutoff
+        )
+    return cutoff
 
 
 def band_limit(

@@ -338,7 +338,9 @@ if [ ${stage} -le 10 ] && [ ${stop_stage} -ge 10 ]; then
       # original 24 kHz prompt rather than the degraded one. Scoring against a
       # degraded reference would measure the degradation instead of the
       # synthesis, and would flatter every system equally.
-      for system in bwe bwe_bypass_resunet bwe_bypass_full stock; do
+      # The arm list is overridable so that a sibling study can reuse this
+      # scoring stage verbatim rather than copying it.
+      for system in ${eval_systems:-bwe bwe_bypass_resunet bwe_bypass_full stock}; do
             for rate in ${eval_rates}; do
                   wav_path=${results_dir}/${system}_sr${rate}
                   [ -d "${wav_path}" ] || continue

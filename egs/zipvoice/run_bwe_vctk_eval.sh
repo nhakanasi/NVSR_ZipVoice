@@ -104,7 +104,7 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
       # Scored against test_score.tsv, which points at the original 24 kHz
       # prompt rather than the degraded one, so the score measures the synthesis
       # instead of the degradation.
-      for system in bwe bwe_bypass_resunet bwe_bypass_full stock; do
+      for system in ${eval_systems:-bwe bwe_bypass_resunet bwe_bypass_full stock}; do
             for rate in ${eval_rates}; do
                   wav_path=${results_dir}/${system}_sr${rate}
                   [ -d "${wav_path}" ] || continue

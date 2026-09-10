@@ -37,6 +37,8 @@ from pathlib import Path
 import torch
 
 from zipvoice.models.zipvoice import ZipVoice
+from zipvoice.models.zipvoice_adapter import ZipVoiceAdapter
+from zipvoice.models.zipvoice_anyband import ZipVoiceAnyBand
 from zipvoice.models.zipvoice_bwe import ZipVoiceBWE
 from zipvoice.models.zipvoice_dialog import ZipVoiceDialog, ZipVoiceDialogStereo
 from zipvoice.models.zipvoice_distill import ZipVoiceDistill
@@ -96,6 +98,8 @@ def get_parser():
             "zipvoice",
             "zipvoice_distill",
             "zipvoice_bwe",
+            "zipvoice_anyband",
+            "zipvoice_adapter",
             "zipvoice_dialog",
             "zipvoice_dialog_stereo",
         ],
@@ -119,7 +123,13 @@ def main():
     # Any tokenizer can be used here.
     # Use SimpleTokenizer for simplicity.
     tokenizer = SimpleTokenizer(token_file=params.exp_dir / "tokens.txt")
-    if params.model_name in ["zipvoice", "zipvoice_distill", "zipvoice_bwe"]:
+    if params.model_name in [
+        "zipvoice",
+        "zipvoice_distill",
+        "zipvoice_bwe",
+        "zipvoice_anyband",
+        "zipvoice_adapter",
+    ]:
         tokenizer_config = {
             "vocab_size": tokenizer.vocab_size,
             "pad_id": tokenizer.pad_id,
@@ -149,6 +159,20 @@ def main():
         model = ZipVoiceBWE(
             **model_config["model"],
             **model_config.get("bwe", {}),
+            **tokenizer_config,
+            sampling_rate=model_config["feature"]["sampling_rate"],
+        )
+    elif params.model_name == "zipvoice_anyband":
+        model = ZipVoiceAnyBand(
+            **model_config["model"],
+            **model_config.get("anyband", {}),
+            **tokenizer_config,
+            sampling_rate=model_config["feature"]["sampling_rate"],
+        )
+    elif params.model_name == "zipvoice_adapter":
+        model = ZipVoiceAdapter(
+            **model_config["model"],
+            **model_config.get("anyband", {}),
             **tokenizer_config,
             sampling_rate=model_config["feature"]["sampling_rate"],
         )

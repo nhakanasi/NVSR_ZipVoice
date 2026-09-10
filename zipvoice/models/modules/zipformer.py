@@ -245,6 +245,8 @@ class TTSZipformer(nn.Module):
         t: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
         guidance_scale: Optional[Tensor] = None,
+        extra_in: Optional[Tensor] = None,
+        return_hidden: bool = False,
     ) -> Tuple[Tensor, Tensor]:
         """
         Args:
@@ -257,12 +259,23 @@ class TTSZipformer(nn.Module):
             masked position. May be None.
           guidance_scale:
             The guidance scale in classifier-free guidance of distillation model.
+          extra_in:
+            An optional additive term for the input projection's output, of shape
+            (batch_size, seq_len, encoder_dim). It is added after ``in_proj`` so
+            that a caller can inject extra conditioning without widening
+            ``in_proj`` itself. When None, the forward pass is unchanged.
+          return_hidden:
+            When True, also return the encoder stack's output before
+            ``out_proj``, of shape (batch_size, seq_len, encoder_dim), so that a
+            caller can attach its own read-out head.
         Returns:
           Return the output embeddings. its shape is
             (batch_size, output_seq_len, encoder_dim)
         """
         x = x.permute(1, 0, 2)
         x = self.in_proj(x)
+        if extra_in is not None:
+            x = x + extra_in.permute(1, 0, 2)
 
         if t is not None:
             assert t.dim() == 1 or t.dim() == 2, t.shape
@@ -288,8 +301,11 @@ class TTSZipformer(nn.Module):
                 src_key_padding_mask=padding_mask,
                 attn_mask=attn_mask,
             )
+        hidden = x
         x = self.out_proj(x)
         x = x.permute(1, 0, 2)
+        if return_hidden:
+            return x, hidden.permute(1, 0, 2)
         return x
 
 
