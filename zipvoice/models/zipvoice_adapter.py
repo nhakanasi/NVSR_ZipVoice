@@ -57,7 +57,7 @@ encoder already pools whatever the mel contains, and the branch's strength is
 now decided by the band mask and by the optimizer rather than by a scalar.
 """
 
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -286,7 +286,7 @@ class ZipVoiceAdapter(ZipVoice):
         curriculum_total: int = 0,
         recon_loss_weight: float = 1.0,
         **unused,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         """Forward pass for training.
 
         Two terms, and only two. The first is ZipVoice's own flow-matching loss
@@ -309,8 +309,14 @@ class ZipVoiceAdapter(ZipVoice):
         competing hypotheses, and it is what neural vocoders and bandwidth
         extenders are trained with for the same reason.
 
-        Returns the two loss terms and the branch's residual rms, which is
-        telemetry only.
+        Returns the two loss terms and an ``aux`` dict. ``aux`` carries the
+        branch's residual rms, which is telemetry only, together with the
+        endpoint estimate, the target, each utterance's generated span and ``t``.
+        Those last four exist so the training script can charge additional losses
+        on the generated audio without the modules that compute them becoming
+        part of the model: anything attached here would enter the checkpoint and
+        the averaged model, and the checkpoint has to stay the released tensors
+        plus the branch.
         """
         (text_condition, padding_mask,) = self.forward_text_train(
             tokens=tokens,
@@ -381,7 +387,20 @@ class ZipVoiceAdapter(ZipVoice):
         recon_loss = ((x1_hat - features).abs() * weight).sum() / denom
         recon_loss = recon_loss * recon_loss_weight
 
-        return fm_loss, recon_loss, self._residual_rms
+        # ``condition_time_mask`` masks one contiguous window per utterance, so
+        # the span is recovered from the mask itself rather than plumbed out of
+        # it: the first masked frame, and that plus the count.
+        span_len = speech_condition_mask.sum(dim=1)
+        starts = speech_condition_mask.float().argmax(dim=1)
+        aux = {
+            "residual_rms": self._residual_rms,
+            "x1_hat": x1_hat,
+            "features": features,
+            "span_starts": starts,
+            "span_ends": starts + span_len,
+            "t": t.reshape(-1),
+        }
+        return fm_loss, recon_loss, aux
 
     def set_trainable(self, mode: str) -> None:
         """Select which parameters the optimiser sees.

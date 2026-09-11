@@ -81,6 +81,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 import zipvoice.utils.diagnostics as diagnostics
 from zipvoice.dataset.datamodule import TtsDataModule
+from zipvoice.models.modules.perceptual import SpeakerPerceptual
 from zipvoice.models.zipvoice_adapter import ZipVoiceAdapter
 from zipvoice.tokenizer.tokenizer import (
     EmiliaTokenizer,
@@ -517,6 +518,74 @@ def add_adapter_arguments(parser: argparse.ArgumentParser) -> None:
         help="Total number of steps the curriculum is scheduled against.",
     )
 
+    # The perceptual terms. Both default to 0, so the recipe is the two-term
+    # objective unless a weight is asked for, and the module that computes them
+    # is not even constructed.
+    parser.add_argument(
+        "--identity-loss-weight",
+        type=float,
+        default=0.0,
+        help="Weight of the speaker identity loss: one minus the cosine "
+        "similarity between frozen speaker embeddings of the vocoded endpoint "
+        "estimate and the vocoded target. Neither of the other two terms carries "
+        "speaker identity -- flow matching scores the frozen backbone's velocity "
+        "and the L1 is minimised by a speaker-generic high band -- so without "
+        "this the branch invents a plausible band belonging to nobody.",
+    )
+
+    parser.add_argument(
+        "--fmatch-loss-weight",
+        type=float,
+        default=0.0,
+        help="Weight of the deep feature matching loss: L1 between the speaker "
+        "encoder's intermediate activations for the two vocoded signals, each "
+        "stage normalised by the reference's own scale. This is a perceptual "
+        "distance, not a discriminator: no GAN and no new trainable parameters.",
+    )
+
+    parser.add_argument(
+        "--perceptual-t-min",
+        type=float,
+        default=0.5,
+        help="Only utterances with flow time at least this contribute to the "
+        "perceptual terms. Below it the endpoint estimate is largely noise and "
+        "the distance between two embeddings of noise is not a speaker signal.",
+    )
+
+    parser.add_argument(
+        "--perceptual-max-utts",
+        type=int,
+        default=4,
+        help="Cap on utterances per step that go through the vocoder and the "
+        "speaker encoder. This is what bounds the step time cost, since both run "
+        "forward and backward on audio.",
+    )
+
+    parser.add_argument(
+        "--perceptual-start-step",
+        type=int,
+        default=0,
+        help="Delay the perceptual terms until this step, for a warm start.",
+    )
+
+    parser.add_argument(
+        "--speaker-encoder-checkpoint",
+        type=str,
+        default="",
+        help="Path to the pyannote WeSpeaker ResNet34 checkpoint used for the "
+        "identity and feature matching losses. Deliberately not the WavLM-ECAPA "
+        "the SIM-o evaluation uses: with disjoint architectures and training "
+        "data a reported gain is transfer, not the objective scoring itself.",
+    )
+
+    parser.add_argument(
+        "--vocos-local-path",
+        type=str,
+        default="",
+        help="Directory holding the Vocos config.yaml and pytorch_model.bin. "
+        "Empty downloads charactr/vocos-mel-24khz.",
+    )
+
 
 def get_params() -> AttributeDict:
     """Return a dict containing training parameters.
@@ -575,6 +644,7 @@ def compute_fbank_loss(
     features_lens: Tensor,
     tokens: List[List[int]],
     is_training: bool,
+    perceptual: Optional[nn.Module] = None,
 ) -> Tuple[Tensor, MetricsTracker]:
     """
     Compute loss given the model and its inputs.
@@ -594,6 +664,12 @@ def compute_fbank_loss(
         True for training. False for validation. When it is True, this
         function enables autograd during computation; when it is False, it
         disables autograd.
+      perceptual:
+        The frozen vocoder and speaker encoder that produce the identity and
+        feature matching losses, or None when neither is weighted. It is passed
+        in rather than held on the model or on ``params``: anything on the model
+        would enter the checkpoint and the averaged model, and ``params`` is
+        written into the checkpoint key by key (``utils/checkpoint.py:110``).
     """
 
     device = model.device if isinstance(model, DDP) else next(model.parameters()).device
@@ -615,7 +691,7 @@ def compute_fbank_loss(
 
     with torch.set_grad_enabled(is_training):
 
-        fm_loss, recon_loss, residual_rms = model(
+        fm_loss, recon_loss, aux = model(
             tokens=tokens,
             features=features,
             features_lens=features_lens,
@@ -627,6 +703,35 @@ def compute_fbank_loss(
             recon_loss_weight=params.recon_loss_weight,
         )
         loss = fm_loss + recon_loss
+
+        identity_loss = torch.zeros((), device=device)
+        fmatch_loss = torch.zeros((), device=device)
+        num_perceptual = 0
+        if (
+            perceptual is not None
+            and params.batch_idx_train >= params.perceptual_start_step
+        ):
+            # Only utterances far enough along the flow contribute. Near t=0 the
+            # endpoint estimate is mostly noise, and the distance between two
+            # embeddings of noise says nothing about whether the branch is
+            # writing the right speaker.
+            keep = (aux["t"] >= params.perceptual_t_min).nonzero().flatten()
+            keep = keep[: params.perceptual_max_utts]
+            if keep.numel() > 0:
+                # fp32: the vocoder's ISTFT overflows readily in half precision,
+                # and the backward pass runs through it.
+                with torch_autocast(dtype=torch.float16, enabled=False):
+                    identity_loss, fmatch_loss, num_perceptual = perceptual(
+                        aux["x1_hat"][keep],
+                        aux["features"][keep],
+                        aux["span_starts"][keep],
+                        aux["span_ends"][keep],
+                    )
+                loss = (
+                    loss
+                    + params.identity_loss_weight * identity_loss
+                    + params.fmatch_loss_weight * fmatch_loss
+                )
 
     assert loss.requires_grad == is_training
 
@@ -640,7 +745,14 @@ def compute_fbank_loss(
     # shared with everything else; this is the one number that would show the
     # same thing here, so it is on the training curves rather than left to a
     # post-hoc probe.
-    info["residual_rms"] = residual_rms.cpu().item() * num_frames
+    info["residual_rms"] = aux["residual_rms"].cpu().item() * num_frames
+    if perceptual is not None:
+        info["identity_loss"] = identity_loss.detach().cpu().item() * num_frames
+        info["fmatch_loss"] = fmatch_loss.detach().cpu().item() * num_frames
+        # How many utterances actually cleared the t gate and the length floor.
+        # If this sits at zero the two terms above are zero for a reason that
+        # has nothing to do with the branch having learned anything.
+        info["perceptual_utts"] = num_perceptual * num_frames
 
     return loss, info
 
@@ -657,6 +769,7 @@ def train_one_epoch(
     tb_writer: Optional[SummaryWriter] = None,
     world_size: int = 1,
     rank: int = 0,
+    perceptual: Optional[nn.Module] = None,
 ) -> None:
     """Train the model for one epoch.
 
@@ -729,6 +842,7 @@ def train_one_epoch(
                 model=model,
                 valid_dl=valid_dl,
                 world_size=world_size,
+                perceptual=perceptual,
             )
             model.train()
             logging.info(
@@ -765,6 +879,7 @@ def train_one_epoch(
                     features_lens=features_lens,
                     tokens=tokens,
                     is_training=True,
+                    perceptual=perceptual,
                 )
 
             tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
@@ -887,6 +1002,7 @@ def compute_validation_loss(
     model: Union[nn.Module, DDP],
     valid_dl: torch.utils.data.DataLoader,
     world_size: int = 1,
+    perceptual: Optional[nn.Module] = None,
 ) -> MetricsTracker:
     """Run the validation process."""
 
@@ -912,6 +1028,7 @@ def compute_validation_loss(
             features_lens=features_lens,
             tokens=tokens,
             is_training=False,
+            perceptual=perceptual,
         )
         assert loss.requires_grad is False
         tot_loss = tot_loss + loss_info
@@ -961,6 +1078,7 @@ def scan_pessimistic_batches_for_oom(
     train_dl: torch.utils.data.DataLoader,
     optimizer: torch.optim.Optimizer,
     params: AttributeDict,
+    perceptual: Optional[nn.Module] = None,
 ):
     from lhotse.dataset import find_pessimistic_batches
 
@@ -989,6 +1107,7 @@ def scan_pessimistic_batches_for_oom(
                     features_lens=features_lens,
                     tokens=tokens,
                     is_training=True,
+                    perceptual=perceptual,
                 )
             loss.backward()
             optimizer.zero_grad()
@@ -1150,6 +1269,29 @@ def run(rank, world_size, args):
     )
 
     model = model.to(params.device)
+
+    # Built here and kept out of the model on purpose: it holds a 13.5M-parameter
+    # vocoder and a 6.6M-parameter speaker encoder, none of it trainable, and a
+    # checkpoint has to stay the released tensors plus the branch so it can be
+    # merged back onto the released model.
+    perceptual = None
+    if params.identity_loss_weight > 0.0 or params.fmatch_loss_weight > 0.0:
+        assert params.speaker_encoder_checkpoint, (
+            "--identity-loss-weight or --fmatch-loss-weight is set but "
+            "--speaker-encoder-checkpoint is empty"
+        )
+        perceptual = SpeakerPerceptual(
+            speaker_checkpoint=params.speaker_encoder_checkpoint,
+            vocos_local_path=params.vocos_local_path or None,
+            feat_scale=params.feat_scale,
+        ).to(params.device)
+        logging.info(
+            f"Perceptual losses on: identity {params.identity_loss_weight}, "
+            f"fmatch {params.fmatch_loss_weight}, "
+            f"t >= {params.perceptual_t_min}, "
+            f"at most {params.perceptual_max_utts} utterances per step"
+        )
+
     if world_size > 1:
         logging.info("Using DDP")
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
@@ -1279,6 +1421,7 @@ def run(rank, world_size, args):
             train_dl=train_dl,
             optimizer=optimizer,
             params=params,
+            perceptual=perceptual,
         )
 
     logging.info("Training started")
@@ -1308,6 +1451,7 @@ def run(rank, world_size, args):
             tb_writer=tb_writer,
             world_size=world_size,
             rank=rank,
+            perceptual=perceptual,
         )
 
         if params.num_iters > 0 and params.batch_idx_train > params.num_iters:
