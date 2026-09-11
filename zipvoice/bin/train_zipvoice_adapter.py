@@ -82,7 +82,7 @@ from torch.utils.tensorboard import SummaryWriter
 import zipvoice.utils.diagnostics as diagnostics
 from zipvoice.dataset.datamodule import TtsDataModule
 from zipvoice.models.modules.perceptual import SpeakerPerceptual
-from zipvoice.models.zipvoice_adapter import ZipVoiceAdapter
+from zipvoice.models.zipvoice_adapter import ZipVoiceAdapter, adapter_kwargs
 from zipvoice.tokenizer.tokenizer import (
     EmiliaTokenizer,
     EspeakTokenizer,
@@ -509,6 +509,23 @@ def add_adapter_arguments(parser: argparse.ArgumentParser) -> None:
         help="Fraction of each batch left entirely un-band-limited, so the "
         "original full-band condition of the pretrained backbone is preserved "
         "and the gate sees band_frac=0 during training.",
+    )
+
+    parser.add_argument(
+        "--use-f0-cond",
+        type=str2bool,
+        default=None,
+        help="Give the branch a per-frame pitch track of the prompt, estimated "
+        "from the band-limited condition mel, as an extra conditioning stream. "
+        "Overrides the model config; None keeps whatever the config says.",
+    )
+
+    parser.add_argument(
+        "--use-rate-cond",
+        type=str2bool,
+        default=None,
+        help="Give the branch the cutoff frequency as an embedded number rather "
+        "than only as the shape of the band mask. Overrides the model config.",
     )
 
     parser.add_argument(
@@ -1158,6 +1175,16 @@ def run(rank, world_size, args):
         params.num_epochs = 1000000
     with open(params.model_config, "r") as f:
         model_config = json.load(f)
+    # Resolve the command-line stream overrides into the config before anything
+    # else reads it, so the copy written to the experiment directory describes
+    # the model that was actually trained. Model averaging and inference build
+    # from that copy, and a checkpoint does not load strictly into a model
+    # missing one of its streams.
+    model_config["adapter"] = adapter_kwargs(
+        model_config,
+        use_f0_cond=params.use_f0_cond,
+        use_rate_cond=params.use_rate_cond,
+    )
     params.update(model_config["model"])
     params.update(model_config["feature"])
 
@@ -1166,7 +1193,8 @@ def run(rank, world_size, args):
         setup_dist(rank, world_size, params.master_port)
 
     os.makedirs(f"{params.exp_dir}", exist_ok=True)
-    copyfile(src=params.model_config, dst=f"{params.exp_dir}/model.json")
+    with open(f"{params.exp_dir}/model.json", "w") as f:
+        json.dump(model_config, f, indent=2)
     copyfile(src=params.token_file, dst=f"{params.exp_dir}/tokens.txt")
     setup_logger(f"{params.exp_dir}/log/log-train")
 
@@ -1195,7 +1223,7 @@ def run(rank, world_size, args):
 
     model = ZipVoiceAdapter(
         **model_config["model"],
-        **model_config.get("adapter", {}),
+        **model_config["adapter"],
         **tokenizer_config,
         feat_scale=params.feat_scale,
         cutoff_min=params.cutoff_min,

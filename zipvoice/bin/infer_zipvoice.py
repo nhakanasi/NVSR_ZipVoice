@@ -80,7 +80,7 @@ from lhotse.utils import fix_random_seed
 from vocos import Vocos
 
 from zipvoice.models.zipvoice import ZipVoice
-from zipvoice.models.zipvoice_adapter import ZipVoiceAdapter
+from zipvoice.models.zipvoice_adapter import ZipVoiceAdapter, adapter_kwargs
 from zipvoice.models.zipvoice_bwe import ZipVoiceBWE
 from zipvoice.models.zipvoice_distill import ZipVoiceDistill
 from zipvoice.tokenizer.tokenizer import (
@@ -316,6 +316,23 @@ def get_parser():
         "which is the same input stock ZipVoice sees and so isolates the "
         "extender from the fine-tuning that trained it. Ignored by other "
         "models.",
+    )
+
+    parser.add_argument(
+        "--use-f0-cond",
+        type=str2bool,
+        default=None,
+        help="Must match the zipvoice_adapter checkpoint being loaded: whether "
+        "its branch was trained with the prompt pitch-track conditioning "
+        "stream. None keeps whatever the model config says.",
+    )
+
+    parser.add_argument(
+        "--use-rate-cond",
+        type=str2bool,
+        default=None,
+        help="Must match the zipvoice_adapter checkpoint being loaded: whether "
+        "its branch was trained with the cutoff-frequency conditioning stream.",
     )
 
     parser.add_argument(
@@ -948,7 +965,11 @@ def main():
     elif params.model_name == "zipvoice_adapter":
         model = ZipVoiceAdapter(
             **model_config["model"],
-            **model_config.get("adapter", {}),
+            **adapter_kwargs(
+                model_config,
+                use_f0_cond=params.use_f0_cond,
+                use_rate_cond=params.use_rate_cond,
+            ),
             **tokenizer_config,
             feat_scale=params.feat_scale,
             sampling_rate=model_config["feature"]["sampling_rate"],

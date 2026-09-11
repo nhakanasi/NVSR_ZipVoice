@@ -16,28 +16,41 @@
 
 """The side branch of :class:`~zipvoice.models.zipvoice_adapter.ZipVoiceAdapter`.
 
-Two modules, in the order the branch uses them.
+The branch is fed by one or more *conditioning streams*, each of which turns
+some view of the prompt into a per-frame sequence. Streams are concatenated
+along the channel axis, so each keeps its own channels rather than having to
+share them, and :class:`BandAdapter` projects the result back to its own width
+at the entrance.
 
-:class:`FrequencyEncoder` is the feature extractor, and is AnyBand's frequency
-encoder ("AnyBand: Unified Multi-Bandwidth Speech Extension via Frequency-Aware
-In-Context Spectral Infilling", arXiv 2608.00572). Its observation is that a
-frame-wise projection of a mel spectrogram destroys the structure that decides
-what belongs in a missing band: the relationship *between* bins. So the mel bins
-of a single frame are treated as a token sequence and self-attention runs along
-the frequency axis, independently per frame, letting an observed low band speak
-directly to the bins that have to be invented above it.
+:class:`FrequencyEncoder` is the first stream and the only mandatory one. It is
+AnyBand's frequency encoder ("AnyBand: Unified Multi-Bandwidth Speech Extension
+via Frequency-Aware In-Context Spectral Infilling", arXiv 2608.00572). Its
+observation is that a frame-wise projection of a mel spectrogram destroys the
+structure that decides what belongs in a missing band: the relationship
+*between* bins. So the mel bins of a single frame are treated as a token
+sequence and self-attention runs along the frequency axis, independently per
+frame, letting an observed low band speak directly to the bins that have to be
+invented above it.
 
-:class:`BandAdapter` is the ControlNet-style branch proper: the encoder's output
-is cross-attended by the frozen backbone's own hidden state and read out to one
-velocity residual per mel bin.
+:class:`F0Encoder` is an optional stream carrying the prompt's pitch track, and
+:class:`RateEncoder` an optional stream carrying the cutoff frequency as a
+number rather than only as the shape of a mask.
+
+:class:`BandAdapter` is the ControlNet-style branch proper: the concatenated
+stream output is cross-attended by the frozen backbone's own hidden state and
+read out to one velocity residual per mel bin.
 """
 
+import math
 from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+
+from zipvoice.models.modules.bwe_discriminators import f0_from_mel
+from zipvoice.models.modules.zipformer import timestep_embedding
 
 
 class FreqSelfAttention(nn.Module):
@@ -181,6 +194,110 @@ class FrequencyEncoder(nn.Module):
         return self.out_proj(x)
 
 
+class F0Encoder(nn.Module):
+    """The prompt's pitch track, as a per-frame stream.
+
+    F0 is estimated from the band-limited condition mel rather than from audio.
+    That is not a convenience: training band-limits only in the mel domain, so
+    the waveform in the batch is clean and full band, and any pitch tracker run
+    on it would be reading the high band the branch exists to invent. The mel is
+    degraded by construction, so it cannot leak. Nor does the degradation cost
+    anything here -- F0 lives in 60-400 Hz and the lowest cutoff trained is 1000
+    Hz, so no fundamental and few comb harmonics are ever removed.
+
+    Only the prompt contributes. The generated span of the condition is zeroed
+    before it arrives, so a pitch estimate there would be a harmonic comb scored
+    against silence, and were it not zeroed it would be ground truth the model
+    does not have at inference.
+
+    Four values per frame:
+
+    0. ``voiced``, 0 or 1.
+    1. log F0, normalised to roughly [0, 1] over the tracker's own range.
+    2. the same value minus this utterance's mean over its voiced prompt frames:
+       where the speaker sits relative to their own register, which is what a
+       high band correlates with, rather than where they sit on an absolute
+       scale shared with every other speaker.
+    3. ``in_prompt``, 0 or 1. Without it an unvoiced prompt frame and a frame
+       outside the prompt are both all-zero and indistinguishable -- the same
+       argument :class:`FrequencyEncoder` makes for its observed-bin channel.
+       It matters: ``condition_time_mask`` draws the prompt as 0-30% of the
+       utterance, so the prompt is regularly empty, and then this stream
+       contributes its bias and nothing else.
+    """
+
+    def __init__(
+        self,
+        out_dim: int = 64,
+        dim: int = 64,
+        f0_min: float = 60.0,
+        f0_max: float = 400.0,
+    ):
+        super().__init__()
+        self.f0_min = f0_min
+        self.f0_max = f0_max
+        self.in_proj = nn.Linear(4, dim)
+        self.out_proj = nn.Linear(dim, out_dim)
+
+    def forward(
+        self, condition: Tensor, prompt_mask: Tensor, centers: Tensor
+    ) -> Tensor:
+        """
+        Args:
+          condition: the band-limited, prompt-masked condition mel, (B, T, F).
+          prompt_mask: True at frames belonging to the prompt, (B, T).
+          centers: mel filter centre frequencies, (F,).
+        Returns:
+          (B, T, out_dim).
+        """
+        dtype = condition.dtype
+        keep = prompt_mask.to(dtype)
+        f0, voiced = f0_from_mel(
+            condition.float(), centers, f0_min=self.f0_min, f0_max=self.f0_max
+        )
+        voiced = voiced.to(dtype) * keep
+        span = math.log(self.f0_max / self.f0_min)
+        log_f0 = (f0.clamp(min=self.f0_min).log() - math.log(self.f0_min)) / span
+        log_f0 = log_f0.to(dtype) * voiced
+
+        # Mean over this utterance's voiced prompt frames. An utterance with no
+        # such frame -- an empty prompt, or an entirely unvoiced one -- gets a
+        # mean of zero, which leaves channel 2 zero alongside channels 0 and 1
+        # rather than producing a NaN.
+        count = voiced.sum(dim=1, keepdim=True)
+        mean = log_f0.sum(dim=1, keepdim=True) / count.clamp(min=1.0)
+        centred = (log_f0 - mean) * voiced
+
+        tokens = torch.stack([voiced, log_f0, centred, keep], dim=-1)
+        return self.out_proj(F.silu(self.in_proj(tokens)))
+
+
+class RateEncoder(nn.Module):
+    """The cutoff frequency itself, broadcast over time.
+
+    Until this stream, the cutoff reached the model only through the *shape* of
+    the band mask -- where the ramp sits among the mel bins. That is a coarse
+    and indirect encoding of a quantity the branch cares about directly, since
+    it says how far the extrapolation has to reach. Here the number is given as
+    a number, through the same sinusoidal embedding the backbone uses for its
+    own scalar inputs.
+
+    The output is constant along time, so on its own it is a per-utterance bias
+    on the cross-attention keys. That is what it is meant to be.
+    """
+
+    def __init__(self, out_dim: int = 64, dim: int = 64, scale_hz: float = 1000.0):
+        super().__init__()
+        self.dim = dim
+        self.scale_hz = scale_hz
+        self.out_proj = nn.Linear(dim, out_dim)
+
+    def forward(self, cutoff_hz: Tensor, num_frames: int) -> Tensor:
+        """cutoff_hz: (B,) in Hz -> (B, num_frames, out_dim)."""
+        emb = timestep_embedding(cutoff_hz.float() / self.scale_hz, self.dim)
+        return self.out_proj(emb).unsqueeze(1).expand(-1, num_frames, -1)
+
+
 class BandAdapter(nn.Module):
     """A ControlNet-style side branch that predicts a per-bin velocity residual.
 
@@ -217,6 +334,7 @@ class BandAdapter(nn.Module):
         dim: int,
         out_bins: int,
         query_dim: Optional[int] = None,
+        cond_dim: Optional[int] = None,
         num_layers: int = 2,
         num_heads: int = 4,
         kernel_size: int = 5,
@@ -232,11 +350,34 @@ class BandAdapter(nn.Module):
         backbone's hidden state down to ``dim`` at the query, and the read-out
         goes straight from ``dim`` to mel bins, so the wide tensors appear only
         at the two boundaries.
+
+        ``cond_dim`` is the width of the concatenated conditioning streams,
+        which is ``dim`` when the frequency encoder is the only one. When it is
+        wider, ``cond_in`` brings it back to ``dim``, and is initialised as the
+        identity on the frequency encoder's channels and at std 1e-3 on the
+        rest. So the branch starts out reading the stream it would have read
+        without the extras, which the rest of it is sized and initialised
+        around, and the new channels enter as a perturbation the optimizer can
+        nonetheless grow -- the same argument the zero-convolution discussion
+        below makes, and the reason the block is not initialised at exactly
+        zero. It also makes a checkpoint trained without the extra streams a
+        usable starting point, though the streams are meant to be trained with
+        the branch rather than bolted on afterwards.
         """
         super().__init__()
         pad = kernel_size // 2
         query_dim = dim if query_dim is None else query_dim
+        cond_dim = dim if cond_dim is None else cond_dim
         self.q_proj = nn.Linear(query_dim, dim) if query_dim != dim else nn.Identity()
+        if cond_dim != dim:
+            assert cond_dim > dim, (cond_dim, dim)
+            self.cond_in = nn.Linear(cond_dim, dim, bias=False)
+            with torch.no_grad():
+                self.cond_in.weight.zero_()
+                self.cond_in.weight[:, :dim].copy_(torch.eye(dim))
+                self.cond_in.weight[:, dim:].normal_(std=1e-3)
+        else:
+            self.cond_in = nn.Identity()
         self.encoder = nn.Sequential(
             nn.Conv1d(dim, dim, kernel_size, padding=pad),
             nn.SiLU(),
@@ -270,13 +411,14 @@ class BandAdapter(nn.Module):
         cond: Tensor,
         padding_mask: Optional[Tensor] = None,
     ) -> Tensor:
-        """hidden: (B, T, query_dim), cond: (B, T, dim) -> (B, T, out_bins).
+        """hidden: (B, T, query_dim), cond: (B, T, cond_dim) -> (B, T, out_bins).
 
         ``padding_mask`` is True at padded frames and keeps them out of the
         attention's keys, where they would otherwise contribute a learned bias
         to every real frame's output.
         """
-        c = self.encoder(cond.transpose(1, 2)).transpose(1, 2)
+        c = self.cond_in(cond)
+        c = self.encoder(c.transpose(1, 2)).transpose(1, 2)
         state = self.q_proj(hidden)
         for q_norm, kv_norm, attn, conv in zip(
             self.q_norm, self.kv_norm, self.attn, self.out_convs

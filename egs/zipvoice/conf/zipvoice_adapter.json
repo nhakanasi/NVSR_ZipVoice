@@ -31,7 +31,9 @@
     "write_mask_blur" : 5,
     "band_transition_bins" : 3.0,
     "band_floor_jitter" : 0.1,
-    "band_noise_std" : 0.02
+    "band_noise_std" : 0.02,
+    "use_f0_cond" : false,
+    "use_rate_cond" : false
   },
   "feature" : {
     "sampling_rate": 24000,

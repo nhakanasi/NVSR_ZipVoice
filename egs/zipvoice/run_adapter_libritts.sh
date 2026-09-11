@@ -53,8 +53,30 @@ token_file=${download_dir}/zipvoice/tokens.txt
 exp_dir=${exp_dir:-${exp_root}/adapter}
 num_iters=${num_iters:-30000}
 
-# The arm name stages 2 and 3 write and score under. Stage 4 produces a second
-# checkpoint, so those two stages are re-run over it with
+# Extra conditioning streams, concatenated onto the frequency encoder's output.
+# They are part of what the branch is *given*, not of what it is scored on, so
+# they belong in the branch's own training rather than in a finetune: a branch
+# trained for 30k steps without F0 has already learnt to do without it.
+#
+#   --use-f0-cond    the prompt's pitch track, estimated from the band-limited
+#                    condition mel. Not from the waveform: training band-limits
+#                    only in the mel domain, so the audio in the batch is clean
+#                    and full band, and a tracker run on it would be reading the
+#                    high band the branch exists to invent.
+#   --use-rate-cond  the cutoff in Hz, sinusoidally embedded, broadcast over
+#                    time. How far the extrapolation has to reach, as a number.
+#
+# The ablation is one full run per arm, each with its own exp_dir and system:
+#   exp_dir=${exp_root}/adapter      system=adapter      f0=0 rate=0  (baseline)
+#   exp_dir=${exp_root}/adapter_f0   system=adapter_f0   f0=1 rate=0
+#   exp_dir=${exp_root}/adapter_rate system=adapter_rate f0=0 rate=1
+#   exp_dir=${exp_root}/adapter_cond system=adapter_cond f0=1 rate=1
+use_f0_cond=${use_f0_cond:-1}
+use_rate_cond=${use_rate_cond:-1}
+
+# The arm name stages 2 and 3 write and score under. Every other arm -- a
+# conditioning-stream ablation, or stage 4's finetune -- is its own exp_dir, so
+# those two stages are re-run over each with e.g.
 # `system=adapter_id exp_dir=${exp_root}/adapter_id num_iters=10000`.
 system=${system:-adapter}
 
@@ -76,6 +98,8 @@ if [ ${stage} -le 1 ] && [ ${stop_stage} -ge 1 ]; then
             --adapter-trainable adapter \
             --curriculum-steps ${num_iters} \
             --full-band-prob 0.2 \
+            --use-f0-cond ${use_f0_cond} \
+            --use-rate-cond ${use_rate_cond} \
             --exp-dir ${exp_dir}
 
       ${PY} -m zipvoice.bin.generate_averaged_model \
@@ -86,8 +110,11 @@ fi
 
 if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ]; then
       echo "Stage 2: Synthesise from band-limited prompts"
-      cp conf/zipvoice_adapter.json ${exp_dir}/model.json
-      cp ${token_file} ${exp_dir}/tokens.txt
+      # model.json and tokens.txt are written into the experiment directory by
+      # the trainer. model.json in particular is the *resolved* config, carrying
+      # whichever conditioning streams that run enabled, so copying the template
+      # over it here would build an inference model missing them and the
+      # checkpoint would not load.
       for rate in ${eval_rates}; do
             ${PY} -m zipvoice.bin.infer_zipvoice \
                   --model-name zipvoice_adapter \

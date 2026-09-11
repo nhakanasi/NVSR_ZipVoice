@@ -62,7 +62,12 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from zipvoice.models.modules.band_adapter import BandAdapter, FrequencyEncoder
+from zipvoice.models.modules.band_adapter import (
+    BandAdapter,
+    F0Encoder,
+    FrequencyEncoder,
+    RateEncoder,
+)
 from zipvoice.models.modules.bwe import (
     LOG_MEL_FLOOR,
     band_limit,
@@ -71,6 +76,26 @@ from zipvoice.models.modules.bwe import (
 )
 from zipvoice.models.zipvoice import ZipVoice
 from zipvoice.utils.common import condition_time_mask, make_pad_mask
+
+
+def adapter_kwargs(model_config: Dict, **overrides) -> Dict:
+    """The ``adapter`` section of a model config, with command-line overrides.
+
+    The conditioning streams are a property of a training *arm* rather than of
+    the architecture: the ablation runs several finetunes off one checkpoint
+    against one config file. So every script that builds a
+    :class:`ZipVoiceAdapter` takes the same flags, and any whose value is None
+    leaves the config's own value alone. The flags have to be given to
+    inference and to model averaging as well as to training, because a
+    checkpoint carrying a stream's weights will not load strictly into a model
+    built without it -- which is the desired failure, loudly rather than
+    silently.
+    """
+    kwargs = dict(model_config.get("adapter", {}))
+    for name, value in overrides.items():
+        if value is not None:
+            kwargs[name] = value
+    return kwargs
 
 
 class ZipVoiceAdapter(ZipVoice):
@@ -97,6 +122,10 @@ class ZipVoiceAdapter(ZipVoice):
         curriculum_beta: float = 4.0,
         curriculum_rho: float = 0.7,
         full_band_prob: float = 0.2,
+        use_f0_cond: bool = False,
+        f0_cond_dim: int = 64,
+        use_rate_cond: bool = False,
+        rate_cond_dim: int = 64,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -145,10 +174,27 @@ class ZipVoiceAdapter(ZipVoice):
             bin_out=freq_bin_out,
             out_dim=adapter_dim,
         )
+        # Optional extra conditioning streams. Their outputs are concatenated
+        # onto the frequency encoder's along the channel axis, in this fixed
+        # order, so each keeps channels of its own rather than competing for the
+        # frequency encoder's; ``BandAdapter`` projects the result back to
+        # ``adapter_dim`` at its entrance, and that projection is the identity
+        # on the frequency encoder's channels, so a finetune from a checkpoint
+        # trained without these streams starts at that checkpoint's function.
+        self.f0_encoder = F0Encoder(out_dim=f0_cond_dim) if use_f0_cond else None
+        self.rate_encoder = (
+            RateEncoder(out_dim=rate_cond_dim) if use_rate_cond else None
+        )
+        cond_dim = adapter_dim
+        if self.f0_encoder is not None:
+            cond_dim += f0_cond_dim
+        if self.rate_encoder is not None:
+            cond_dim += rate_cond_dim
         self.adapter = BandAdapter(
             dim=adapter_dim,
             out_bins=self.feat_dim,
             query_dim=decoder_dim,
+            cond_dim=cond_dim,
             num_layers=adapter_layers,
             num_heads=adapter_heads,
             kernel_size=adapter_kernel,
@@ -211,6 +257,8 @@ class ZipVoiceAdapter(ZipVoice):
         padding_mask: Optional[torch.Tensor] = None,
         guidance_scale: Optional[torch.Tensor] = None,
         band_mask: Optional[torch.Tensor] = None,
+        cutoff_hz: Optional[torch.Tensor] = None,
+        prompt_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Velocity from the frozen backbone plus the branch's band residual.
 
@@ -219,6 +267,10 @@ class ZipVoiceAdapter(ZipVoice):
                 shape (B, 1, F), soft on the transition. None declares the
                 prompt full band, in which case the branch contributes exactly
                 zero.
+            cutoff_hz: the prompt's cutoff in Hz, of shape (B,), for the rate
+                stream. None means full band, which is ``cutoff_max``.
+            prompt_mask: True at frames carrying prompt, of shape (B, T), for
+                the F0 stream. None means every non-padded frame.
 
         The other arguments are as in the base class.
         """
@@ -257,7 +309,30 @@ class ZipVoiceAdapter(ZipVoice):
             return_hidden=True,
         )
 
-        cond_feature = self.freq_encoder(speech_condition, band_mask)
+        # Streams are concatenated in the fixed order the constructor sized
+        # ``cond_dim`` for: frequency encoder, then F0, then rate.
+        streams = [self.freq_encoder(speech_condition, band_mask)]
+        if self.f0_encoder is not None:
+            if prompt_mask is None:
+                prompt_mask = (
+                    torch.ones(batch, num_frames, dtype=torch.bool, device=device)
+                    if padding_mask is None
+                    else ~padding_mask
+                )
+            streams.append(
+                self.f0_encoder(
+                    speech_condition,
+                    self._expand_to_batch(prompt_mask, batch),
+                    self.mel_centers,
+                )
+            )
+        if self.rate_encoder is not None:
+            if cutoff_hz is None:
+                cutoff_hz = torch.full((batch,), self.cutoff_max, device=device)
+            streams.append(
+                self.rate_encoder(self._expand_to_batch(cutoff_hz, batch), num_frames)
+            )
+        cond_feature = torch.cat(streams, dim=-1) if len(streams) > 1 else streams[0]
         residual = self.adapter(hidden, cond_feature, padding_mask)
         residual = residual * self._write_mask(band_mask)
         # Telemetry only; read by the training loop in place of the gate value
@@ -368,6 +443,8 @@ class ZipVoiceAdapter(ZipVoice):
             speech_condition=speech_condition,
             padding_mask=padding_mask,
             band_mask=band_mask,
+            cutoff_hz=cutoff_hz,
+            prompt_mask=~speech_condition_mask & ~padding_mask,
         )
 
         valid = ~padding_mask
@@ -417,6 +494,9 @@ class ZipVoiceAdapter(ZipVoice):
             return
         self.requires_grad_(False)
         self.freq_encoder.requires_grad_(True)
+        for stream in (self.f0_encoder, self.rate_encoder):
+            if stream is not None:
+                stream.requires_grad_(True)
         self.adapter.requires_grad_(True)
         if mode == "decoder":
             self.fm_decoder.requires_grad_(True)
@@ -482,17 +562,18 @@ class ZipVoiceAdapter(ZipVoice):
             speech_condition,
         )
 
+        cutoff = torch.full(
+            (batch_size,),
+            self.cutoff_max if cutoff_hz is None else float(cutoff_hz),
+            device=device,
+        )
         if cutoff_hz is None:
             band_mask = torch.zeros(batch_size, 1, self.feat_dim, device=device)
         else:
             # The prompt arrives already band-limited by its own recording rate,
             # so only the mask is wanted here; re-imposing the floor as well
             # would be a second degradation on top of the real one.
-            _, band_mask = self._band_limit(
-                speech_condition,
-                torch.full((batch_size,), float(cutoff_hz), device=device),
-                randomize=False,
-            )
+            _, band_mask = self._band_limit(speech_condition, cutoff, randomize=False)
 
         x0 = torch.randn(
             batch_size, num_frames, prompt_features.size(-1), device=device
@@ -507,6 +588,10 @@ class ZipVoiceAdapter(ZipVoice):
             guidance_scale=guidance_scale,
             t_shift=t_shift,
             band_mask=band_mask,
+            cutoff_hz=cutoff,
+            # Same polarity as training's ``condition_time_mask``: True is the
+            # span being generated, so the prompt is its complement.
+            prompt_mask=~speech_condition_mask & ~padding_mask,
         )
 
         x1_wo_prompt_lens = (~padding_mask).sum(-1) - prompt_features_lens
