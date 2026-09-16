@@ -31,7 +31,7 @@ Contents:
 """
 
 import math
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -236,6 +236,104 @@ def band_limit(
 
     masked = features * (1.0 - mask) + fill * mask
     return masked, mask
+
+
+def resample_band_limit(
+    audio: torch.Tensor,
+    audio_lens: torch.Tensor,
+    cutoff_hz: torch.Tensor,
+    fbank: torch.nn.Module,
+    num_frames: int,
+    sampling_rate: int = 24000,
+    rate_quant: int = 250,
+    return_audio: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """Band-limit by actually resampling the waveform, then re-extracting.
+
+    ``band_limit`` above degrades in the mel domain, which is cheap and which
+    the whole first round of experiments used. Measured against a real
+    resampling on LibriTTS dev-clean at a 4 kHz cutoff, it is also wrong by a
+    wide margin: it drives every bin above the cutoff to ``LOG_MEL_FLOOR``
+    within four bins, where a file that has genuinely been through 24k -> 8k ->
+    24k sits 9 to 13 log-units higher and is still rolling off at 6 kHz. Mean
+    absolute difference between the two over the removed band is 8.7 log-units,
+    against a clean-signal range of about 2.
+
+    That gap is a train/test mismatch and not a subtle one: evaluation prompts
+    are produced by ``local/prepare_bwe_eval.py``, which resamples the file, so
+    the frozen backbone is conditioned at training on a flat floor no microphone
+    produces and at inference on a real roll-off. This function removes the
+    mismatch by making training do what evaluation does -- the same two
+    ``torchaudio.functional.resample`` calls, then the same ``VocosFbank``.
+
+    Args:
+        audio: waveforms at ``sampling_rate``, of shape ``(B, S)``.
+        audio_lens: valid sample count per utterance, of shape ``(B,)``.
+        cutoff_hz: cutoff per utterance, of shape ``(B,)``. A cutoff at or above
+            Nyquist leaves that utterance untouched, which is what the full-band
+            fraction of every batch needs.
+        fbank: the extractor's ``MelSpectrogram`` module, on the right device.
+            The same object the precomputed features were made with, so the
+            observed band agrees with them.
+        num_frames: frame count to return, matching the precomputed features.
+        sampling_rate: the waveform's rate.
+        return_audio: also return the degraded waveform. It is the
+            intermediate this function already computes, and it is what a
+            waveform-input model -- a pretrained speaker encoder, say -- should
+            be fed: it is the real band-limited signal, not a vocoder's
+            rendering of its mel.
+        rate_quant: target rates are rounded to this grid. Cutoffs are drawn
+            continuously, and ``torchaudio.functional.resample`` builds and
+            caches a kernel per (from, to) pair; without a grid almost every
+            utterance would miss the cache.
+
+    Returns:
+        The degraded log-mel, of shape ``(B, num_frames, F)``, unscaled -- the
+        caller applies ``feat_scale``, as it does to the clean features. With
+        ``return_audio``, also the degraded waveform, of shape ``(B, S)``.
+    """
+    import torchaudio
+
+    device = audio.device
+    nyquist = sampling_rate / 2.0
+    out = torch.empty(
+        audio.size(0), num_frames, fbank.n_mels, device=device, dtype=audio.dtype
+    )
+    degraded = torch.empty_like(audio) if return_audio else None
+
+    # Grouped by target rate so one kernel serves every utterance that shares
+    # it. Resampling is done per group rather than per utterance because the
+    # kernel, not the convolution, is the expensive part.
+    target = torch.where(
+        cutoff_hz >= nyquist,
+        torch.zeros_like(cutoff_hz),
+        (cutoff_hz * 2.0 / rate_quant).round() * rate_quant,
+    ).long()
+
+    for rate in target.unique().tolist():
+        rows = (target == rate).nonzero().flatten()
+        wav = audio[rows]
+        if rate > 0:
+            # Exactly the evaluation pipeline's degradation, in the same order.
+            down = torchaudio.functional.resample(wav, sampling_rate, rate)
+            wav = torchaudio.functional.resample(down, rate, sampling_rate)
+            # The round trip can return a sample or two short or long.
+            if wav.size(-1) < audio.size(-1):
+                wav = torch.nn.functional.pad(wav, (0, audio.size(-1) - wav.size(-1)))
+            else:
+                wav = wav[..., : audio.size(-1)]
+            # Padding in the batch is zeros; resampling smears a little energy
+            # into it, which would otherwise become spurious frames.
+            idx = torch.arange(wav.size(-1), device=device)
+            wav = wav * (idx.unsqueeze(0) < audio_lens[rows].unsqueeze(1))
+        if degraded is not None:
+            degraded[rows] = wav.to(degraded.dtype)
+        mel = fbank(wav).clamp(min=1e-7).log().transpose(1, 2)  # (b, T, F)
+        if mel.size(1) < num_frames:
+            mel = torch.nn.functional.pad(mel, (0, 0, 0, num_frames - mel.size(1)))
+        out[rows] = mel[:, :num_frames].to(out.dtype)
+
+    return (out, degraded) if return_audio else out
 
 
 def _to_db(features: torch.Tensor, feat_scale: float) -> torch.Tensor:

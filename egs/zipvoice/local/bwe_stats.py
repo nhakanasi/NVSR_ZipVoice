@@ -132,6 +132,31 @@ def get_parser() -> argparse.ArgumentParser:
         first entry of --conditions.
         """,
     )
+
+    sim = sub.add_parser(
+        "sim", help="Paired SIM-o comparison over saved per-utterance similarities."
+    )
+    sim.add_argument(
+        "--results-dir",
+        type=str,
+        required=True,
+        help="Directory holding one subdirectory per condition.",
+    )
+    sim.add_argument(
+        "--conditions",
+        type=str,
+        nargs="+",
+        required=True,
+        help="Condition subdirectory names, each containing a sim_scores.tsv.",
+    )
+    sim.add_argument(
+        "--baseline",
+        type=str,
+        default=None,
+        help="""Condition to compare every other one against. Defaults to the
+        first entry of --conditions.
+        """,
+    )
     return parser
 
 
@@ -292,10 +317,68 @@ def run_wer(args) -> None:
     print("-" * 78)
 
 
+def load_sims(path: str) -> Dict[str, float]:
+    """Per-utterance SIM-o keyed by wav name."""
+    out = OrderedDict()
+    with open(path, "r", encoding="utf-8") as f:
+        f.readline()  # header: wav_name<TAB>sim
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) == 2:
+                out[parts[0]] = float(parts[1])
+    return out
+
+
+def run_sim(args) -> None:
+    baseline: Optional[str] = args.baseline or args.conditions[0]
+    if baseline not in args.conditions:
+        raise SystemExit(f"--baseline {baseline} is not in --conditions")
+
+    data = {}
+    for cond in args.conditions:
+        path = os.path.join(args.results_dir, cond, "sim_scores.tsv")
+        if not os.path.exists(path):
+            raise SystemExit(
+                f"Missing {path}; rescore with zipvoice.eval.speaker_similarity.sim "
+                "--score-path."
+            )
+        data[cond] = load_sims(path)
+
+    print("-" * 78)
+    print(f"{'condition':<34}{'SIM-o':>10}{'sd':>10}{'n':>6}")
+    for cond, rows in data.items():
+        values = np.array(list(rows.values()))
+        print(f"{cond:<34}{values.mean():>10.3f}{values.std(ddof=1):>10.3f}"
+              f"{len(values):>6}")
+
+    # The paired test is the point of the file. SIM-o differences between these
+    # arms are a few hundredths, the same order as the spread between two runs
+    # of one system, so an unpaired reading of the means cannot separate them --
+    # whereas every arm is scored on the same utterances against the same
+    # prompts, which is exactly when pairing removes the utterance-to-utterance
+    # variance that dominates.
+    print("-" * 78)
+    print(f"paired against {baseline}")
+    print(f"{'condition':<34}{'delta':>10}{'p (t)':>10}{'p (Wilcoxon)':>14}")
+    base = data[baseline]
+    for cond, rows in data.items():
+        if cond == baseline:
+            continue
+        a, b = aligned(rows, base)
+        if not len(a):
+            raise SystemExit(f"No shared utterances between {cond} and {baseline}")
+        _, p_t = stats.ttest_rel(a, b)
+        p_w = stats.wilcoxon(a, b).pvalue if np.any(a != b) else float("nan")
+        print(f"{cond:<34}{(a - b).mean():>+10.3f}{p_t:>10.4f}{p_w:>14.4f}")
+    print("-" * 78)
+
+
 def main() -> None:
     args = get_parser().parse_args()
     if args.command == "tail":
         run_tail(args)
+    elif args.command == "sim":
+        run_sim(args)
     else:
         run_wer(args)
 

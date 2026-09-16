@@ -346,10 +346,16 @@ if [ ${stage} -le 10 ] && [ ${stop_stage} -ge 10 ]; then
                   [ -d "${wav_path}" ] || continue
                   echo "--- ${system} @ ${rate} Hz ---"
 
+                  # --score-path keeps the per-utterance similarities beside the
+                  # audio. SIM-o carries this study's claims and its gaps are
+                  # small next to the between-run noise, so a mean alone cannot
+                  # settle them; local/bwe_stats.py reads these back for the
+                  # paired tests, with no resynthesis and no GPU.
                   ${PY} -m zipvoice.eval.speaker_similarity.sim \
                         --wav-path ${wav_path} \
                         --test-list ${eval_dir}/test_score.tsv \
-                        --model-dir ${eval_model_dir}
+                        --model-dir ${eval_model_dir} \
+                        --score-path ${wav_path}/sim_scores.tsv
 
                   ${PY} -m zipvoice.eval.wer.seedtts \
                         --wav-path ${wav_path} \

@@ -21,12 +21,28 @@ from it are short enough to carry here instead.
 import argparse
 import csv
 import sys
+import time
 from pathlib import Path
 
 import librosa
 import numpy as np
 import soundfile as sf
 import torch
+
+# torchlibrosa, which NVSR's STFT front end uses, calls
+# librosa.util.pad_center(window, n_fft) positionally; librosa made that
+# argument keyword-only in 0.10. The same adaptation is in audiosr_restore.py,
+# for the same reason: pinning librosa back has no wheel for this Python.
+_pad_center = librosa.util.pad_center
+
+
+def _pad_center_compat(data, size=None, *args, **kwargs):
+    if size is not None:
+        kwargs["size"] = size
+    return _pad_center(data, *args, **kwargs)
+
+
+librosa.util.pad_center = _pad_center_compat
 
 NVSR_SR = 44100
 
@@ -112,6 +128,13 @@ def main() -> None:
         default=Path("C:/zipvoice_data/ssr_eval/examples/NVSR"),
     )
     parser.add_argument("--sampling-rate", type=int, default=24000)
+    parser.add_argument(
+        "--timing-path",
+        type=Path,
+        default=None,
+        help="Optional TSV of per-prompt wall time, for the cascade's "
+        "real-time factor. One row per prompt actually restored.",
+    )
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -126,6 +149,8 @@ def main() -> None:
             csv.reader(handle, delimiter="\t", quoting=csv.QUOTE_NONE)
         )
 
+    timings = []
+    restored: dict = {}
     with open(args.out_list, "w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(
             handle,
@@ -135,15 +160,51 @@ def main() -> None:
             quotechar=None,
         )
         for i, row in enumerate(rows):
-            x, _ = librosa.load(row[2], sr=NVSR_SR)
-            y = restore(model, x, device)
-            y = librosa.resample(
-                y, orig_sr=NVSR_SR, target_sr=args.sampling_rate
-            )
-            out_path = args.prompt_dir / f"{row[0]}.wav"
-            sf.write(out_path, y, args.sampling_rate)
-            writer.writerow([row[0], row[1], str(out_path), row[3]])
-            print(f"[{i + 1}/{len(rows)}] {out_path}", flush=True)
+            source = Path(row[2])
+            # Named by the prompt, not by the row: the same prompt serves
+            # several target sentences, and restoring it once per row would
+            # both waste the pass and inflate the measured real-time factor.
+            # An existing file also makes an interrupted run resumable.
+            out_path = args.prompt_dir / f"{source.stem}.wav"
+            if source not in restored:
+                if out_path.is_file():
+                    restored[source] = out_path
+                else:
+                    x, _ = librosa.load(source, sr=NVSR_SR)
+                    start = time.time()
+                    y = restore(model, x, device)
+                    elapsed = time.time() - start
+                    y = librosa.resample(
+                        y, orig_sr=NVSR_SR, target_sr=args.sampling_rate
+                    )
+                    sf.write(out_path, y, args.sampling_rate)
+                    restored[source] = out_path
+                    timings.append(
+                        (
+                            source.stem,
+                            f"{len(y) / args.sampling_rate:.3f}",
+                            f"{elapsed:.3f}",
+                        )
+                    )
+                    print(
+                        f"[{i + 1}/{len(rows)}] {out_path} in {elapsed:.1f}s",
+                        flush=True,
+                    )
+            writer.writerow([row[0], row[1], str(restored[source]), row[3]])
+
+    if args.timing_path is not None and timings:
+        args.timing_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(args.timing_path, "w", encoding="utf-8", newline="") as handle:
+            out = csv.writer(handle, delimiter="\t", lineterminator="\n")
+            out.writerow(["wav_name", "seconds_audio", "seconds_wall"])
+            out.writerows(timings)
+        total_audio = sum(float(t[1]) for t in timings)
+        total_wall = sum(float(t[2]) for t in timings)
+        print(
+            f"Restored {len(timings)} prompts, {total_audio:.1f}s of audio in "
+            f"{total_wall:.1f}s: real-time factor {total_wall / total_audio:.2f}",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":

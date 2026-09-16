@@ -319,11 +319,11 @@ def get_parser():
     )
 
     parser.add_argument(
-        "--use-f0-cond",
+        "--use-speaker-cond",
         type=str2bool,
         default=None,
         help="Must match the zipvoice_adapter checkpoint being loaded: whether "
-        "its branch was trained with the prompt pitch-track conditioning "
+        "its branch was trained with the prompt speaker-statistics conditioning "
         "stream. None keeps whatever the model config says.",
     )
 
@@ -333,6 +333,105 @@ def get_parser():
         default=None,
         help="Must match the zipvoice_adapter checkpoint being loaded: whether "
         "its branch was trained with the cutoff-frequency conditioning stream.",
+    )
+
+    parser.add_argument(
+        "--residual-scale",
+        type=float,
+        default=1.0,
+        help="zipvoice_adapter only: scale the branch's band residual at "
+        "inference. 0.0 reproduces the frozen released model, 1.0 the branch "
+        "as trained. Intermediate values walk the identity / naturalness trade "
+        "the branch makes, without retraining.",
+    )
+
+    parser.add_argument(
+        "--residual-scale-end",
+        type=float,
+        default=-1.0,
+        help="zipvoice_adapter only: the dose at t=1, with --residual-scale "
+        "becoming the dose at t=0 and the two interpolated linearly along the "
+        "solve. -1.0 keeps the flat dose. The branch's writes accumulate in "
+        "the state the next step reads, so the amount by which it lands short "
+        "is not constant along the trajectory and a flat correction is either "
+        "too weak early or too strong late.",
+    )
+
+    parser.add_argument(
+        "--residual-scale-hi",
+        type=float,
+        default=-1.0,
+        help="zipvoice_adapter only: a separate dose above "
+        "--residual-scale-split-hz, with --residual-scale applying below it. "
+        "-1.0 keeps one dose for the whole band. Measured per octave, the "
+        "level deficit is spread over 3-12 kHz while the identity cost of "
+        "raising the dose is concentrated in the octave just above the cutoff, "
+        "where the branch is continuing formant structure the prompt "
+        "half-shows; splitting the dial separates the two.",
+    )
+
+    parser.add_argument(
+        "--residual-scale-split-hz",
+        type=float,
+        default=0.0,
+        help="zipvoice_adapter only: where --residual-scale-hi takes over. 0.0 "
+        "means one octave above each utterance's own cutoff, which is what the "
+        "rate sweep wants; a positive value pins it to a fixed frequency.",
+    )
+
+    parser.add_argument(
+        "--residual-scale-top-hz",
+        type=float,
+        default=0.0,
+        help="zipvoice_adapter only: the frequency at which "
+        "--residual-scale-top applies, with the dose held flat above it. 0.0 "
+        "means the top mel bin. Only meaningful together with "
+        "--residual-scale-top.",
+    )
+
+    parser.add_argument(
+        "--residual-scale-top",
+        type=float,
+        default=-1.0,
+        help="zipvoice_adapter only: the raised dose at "
+        "--residual-scale-top-hz, with --residual-scale-hi applying at the "
+        "split and the two interpolated log-linearly in frequency and held "
+        "flat beyond. -1.0 makes the raised dose a flat step. The same gain "
+        "moves the top of the spectrum far more than the octave above the "
+        "cutoff, so correcting an even deficit needs a dose that falls with "
+        "frequency.",
+    )
+
+    parser.add_argument(
+        "--decouple-residual",
+        type=str2bool,
+        default=False,
+        help="zipvoice_adapter only: keep the branch's writes out of what the "
+        "frozen backbone reads, so the backbone follows the trajectory it would "
+        "have followed alone and the branch's contribution is added on top. "
+        "Inference-only, and closer to how training posed the problem.",
+    )
+
+    parser.add_argument(
+        "--band-fill",
+        type=str2bool,
+        default=False,
+        help="zipvoice_adapter only: the branch emits the missing band as a mel "
+        "rather than a velocity. Its output is kept out of the solver and added "
+        "to the solved sample once, and it carries its own state across the "
+        "steps. Set this iff the checkpoint was trained with --band-fill; on "
+        "any other checkpoint it silently discards the branch.",
+    )
+
+    parser.add_argument(
+        "--speaker-encoder-checkpoint",
+        type=str,
+        default=None,
+        help="zipvoice_adapter only, and required when the branch was trained "
+        "with --use-pretrained-spk 1: the pyannote WeSpeaker ResNet34 .bin the "
+        "prompt is embedded with. Without it the model is handed a zero "
+        "embedding flagged invalid, which is off-distribution for such a "
+        "branch -- so speaker similarity measured that way is not the model's.",
     )
 
     parser.add_argument(
@@ -415,6 +514,9 @@ def band_sample_kwargs(
     model: torch.nn.Module,
     prompt_sampling_rate: int,
     sampling_rate: int,
+    prompt_wav: Optional[torch.Tensor] = None,
+    num_prompt_frames: Optional[int] = None,
+    speaker_perceptual: Optional[torch.nn.Module] = None,
 ) -> dict:
     """
     Extra ``sample`` arguments describing where the prompt's band ends.
@@ -423,6 +525,14 @@ def band_sample_kwargs(
     the band mask itself, so that the branch sees which bins are observed and,
     equivalently, which bins it is allowed to write. Every other model gets
     nothing extra and is unaffected.
+
+    A branch trained with ``--use-pretrained-spk 1`` also reads an embedding of
+    the prompt under a frozen speaker encoder. Training takes that embedding
+    from the *degraded* waveform, and the prompt here is a real band-limited
+    recording, so the same encoder is run on the prompt directly -- the
+    ``embed_audio`` path, no vocoder involved. Leaving it out is not neutral:
+    the model then gets a zero vector flagged invalid, a case training only ever
+    saw for prompts too short to embed.
     """
     if not isinstance(model, ZipVoiceAdapter):
         return {}
@@ -431,7 +541,22 @@ def band_sample_kwargs(
         f"Conditioning on a prompt band-limited at {cutoff_hz:.0f} Hz "
         f"(prompt recorded at {prompt_sampling_rate} Hz)"
     )
-    return {"cutoff_hz": cutoff_hz}
+    kwargs = {"cutoff_hz": cutoff_hz}
+    if (
+        model.pretrained_spk_proj is not None
+        and speaker_perceptual is not None
+        and prompt_wav is not None
+    ):
+        # Every frame of the prompt is prompt; the generated span does not exist
+        # yet and contributes nothing to the embedding at inference.
+        device = next(speaker_perceptual.parameters()).device
+        wav = prompt_wav.to(device)
+        if wav.dim() == 1:
+            wav = wav.unsqueeze(0)
+        prompt_mask = torch.ones(1, num_prompt_frames, dtype=torch.bool, device=device)
+        embedding, valid = speaker_perceptual.embed_audio(wav, prompt_mask)
+        kwargs["speaker_embedding"] = torch.cat([embedding, valid], dim=-1)
+    return kwargs
 
 
 def generate_sentence_raw_evaluation(
@@ -451,6 +576,7 @@ def generate_sentence_raw_evaluation(
     target_rms: float = 0.1,
     feat_scale: float = 0.1,
     sampling_rate: int = 24000,
+    speaker_perceptual: Optional[torch.nn.Module] = None,
 ):
     """
     Generate waveform of a text based on a given prompt waveform and its transcription,
@@ -526,7 +652,14 @@ def generate_sentence_raw_evaluation(
         duration="predict",
         num_step=num_step,
         guidance_scale=guidance_scale,
-        **band_sample_kwargs(model, prompt_sampling_rate, sampling_rate),
+        **band_sample_kwargs(
+            model,
+            prompt_sampling_rate,
+            sampling_rate,
+            prompt_wav=prompt_wav,
+            num_prompt_frames=prompt_features.size(1),
+            speaker_perceptual=speaker_perceptual,
+        ),
     )
 
     # Postprocess predicted features
@@ -581,6 +714,7 @@ def generate_sentence(
     sampling_rate: int = 24000,
     max_duration: float = 100,
     remove_long_sil: bool = False,
+    speaker_perceptual: Optional[torch.nn.Module] = None,
 ):
     """
     Generate waveform of a text based on a given prompt waveform and its transcription,
@@ -709,7 +843,14 @@ def generate_sentence(
             duration="predict",
             num_step=num_step,
             guidance_scale=guidance_scale,
-            **band_sample_kwargs(model, prompt_sampling_rate, sampling_rate),
+            **band_sample_kwargs(
+                model,
+                prompt_sampling_rate,
+                sampling_rate,
+                prompt_wav=prompt_wav,
+                num_prompt_frames=prompt_features.size(1),
+                speaker_perceptual=speaker_perceptual,
+            ),
         )
 
         # Postprocess predicted features
@@ -793,6 +934,7 @@ def generate_list(
     raw_evaluation: bool = False,
     max_duration: float = 100,
     remove_long_sil: bool = False,
+    speaker_perceptual: Optional[torch.nn.Module] = None,
 ):
     total_t = []
     total_t_no_vocoder = []
@@ -823,6 +965,7 @@ def generate_list(
             "target_rms": target_rms,
             "feat_scale": feat_scale,
             "sampling_rate": sampling_rate,
+            "speaker_perceptual": speaker_perceptual,
         }
 
         if raw_evaluation:
@@ -967,7 +1110,7 @@ def main():
             **model_config["model"],
             **adapter_kwargs(
                 model_config,
-                use_f0_cond=params.use_f0_cond,
+                use_speaker_cond=params.use_speaker_cond,
                 use_rate_cond=params.use_rate_cond,
             ),
             **tokenizer_config,
@@ -980,6 +1123,23 @@ def main():
             **model_config["model"],
             **tokenizer_config,
         )
+
+    if params.model_name == "zipvoice_adapter":
+        model.residual_scale = params.residual_scale
+        # Negative means unset on the command line; the model wants None there.
+        model.residual_scale_end = (
+            None if params.residual_scale_end < 0.0 else params.residual_scale_end
+        )
+        model.residual_scale_hi = (
+            None if params.residual_scale_hi < 0.0 else params.residual_scale_hi
+        )
+        model.residual_scale_split_hz = params.residual_scale_split_hz
+        model.residual_scale_top_hz = params.residual_scale_top_hz
+        model.residual_scale_top = (
+            None if params.residual_scale_top < 0.0 else params.residual_scale_top
+        )
+        model.decouple_residual = params.decouple_residual
+        model.band_fill = params.band_fill
 
     if str(model_ckpt).endswith(".safetensors"):
         safetensors.torch.load_model(model, model_ckpt)
@@ -1009,6 +1169,35 @@ def main():
 
     if params.trt_engine_path:
         load_trt(model, params.trt_engine_path)
+
+    # The branch's pretrained speaker stream, if the checkpoint has one. It is
+    # not a submodule of the model -- training owns it the same way -- so it is
+    # built here and handed to the generation functions.
+    speaker_perceptual = None
+    if isinstance(model, ZipVoiceAdapter) and model.pretrained_spk_proj is not None:
+        if params.speaker_encoder_checkpoint:
+            from zipvoice.models.modules.perceptual import SpeakerPerceptual
+
+            speaker_perceptual = (
+                SpeakerPerceptual(
+                    speaker_checkpoint=params.speaker_encoder_checkpoint,
+                    feat_scale=params.feat_scale,
+                )
+                .to(params.device)
+                .eval()
+            )
+            logging.info(
+                "Conditioning the branch on the prompt's speaker embedding "
+                f"({speaker_perceptual.speaker_dim}-dim)"
+            )
+        else:
+            logging.warning(
+                "This checkpoint's branch was trained with a pretrained speaker "
+                "stream, but --speaker-encoder-checkpoint was not given. The "
+                "model will be handed a zero embedding flagged invalid, which "
+                "training only ever saw for unusably short prompts; speaker "
+                "similarity measured this way understates the model."
+            )
 
     vocoder = get_vocoder(params.vocoder_path)
     vocoder = vocoder.to(params.device)
@@ -1044,6 +1233,7 @@ def main():
             raw_evaluation=params.raw_evaluation,
             max_duration=params.max_duration,
             remove_long_sil=params.remove_long_sil,
+            speaker_perceptual=speaker_perceptual,
         )
     else:
         assert (
@@ -1068,6 +1258,7 @@ def main():
             sampling_rate=params.sampling_rate,
             max_duration=params.max_duration,
             remove_long_sil=params.remove_long_sil,
+            speaker_perceptual=speaker_perceptual,
         )
         logging.info(f"Saved to: {params.res_wav_path}")
     logging.info("Done")

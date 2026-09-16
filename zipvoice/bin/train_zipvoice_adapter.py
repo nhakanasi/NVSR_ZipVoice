@@ -81,6 +81,14 @@ from torch.utils.tensorboard import SummaryWriter
 
 import zipvoice.utils.diagnostics as diagnostics
 from zipvoice.dataset.datamodule import TtsDataModule
+from zipvoice.models.modules.bwe_discriminators import (
+    BweDiscriminators,
+    feature_matching_loss,
+    hinge_d_loss,
+    hinge_g_loss,
+)
+from zipvoice.models.modules.bwe import resample_band_limit, sample_cutoff
+from zipvoice.utils.feature import VocosFbank
 from zipvoice.models.modules.perceptual import SpeakerPerceptual
 from zipvoice.models.zipvoice_adapter import ZipVoiceAdapter, adapter_kwargs
 from zipvoice.tokenizer.tokenizer import (
@@ -512,12 +520,25 @@ def add_adapter_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
     parser.add_argument(
-        "--use-f0-cond",
+        "--use-speaker-cond",
         type=str2bool,
         default=None,
-        help="Give the branch a per-frame pitch track of the prompt, estimated "
-        "from the band-limited condition mel, as an extra conditioning stream. "
-        "Overrides the model config; None keeps whatever the config says.",
+        help="Give the branch the prompt's per-bin mean and standard deviation, "
+        "pooled over the prompt frames of the band-limited condition mel, as an "
+        "extra conditioning stream. Overrides the model config; None keeps "
+        "whatever the config says.",
+    )
+
+    parser.add_argument(
+        "--variance-loss-weight",
+        type=float,
+        default=0.0,
+        help="Weight of the dispersion floor: the batch's per-bin standard "
+        "deviation of the written band, charged only where the prediction is "
+        "less varied than the target. It is the term that opposes writing every "
+        "speaker's average high band, which both other losses accept. Always "
+        "computed and logged, so a run at 0 measures its magnitude before a run "
+        "spends gradient on it.",
     )
 
     parser.add_argument(
@@ -527,12 +548,213 @@ def add_adapter_arguments(parser: argparse.ArgumentParser) -> None:
         help="Give the branch the cutoff frequency as an embedded number rather "
         "than only as the shape of the band mask. Overrides the model config.",
     )
+    parser.add_argument(
+        "--mask-xt",
+        type=str2bool,
+        default=None,
+        help="Hide the bins above the cutoff in the flow state from the "
+        "network, so the branch has to synthesise them rather than copy them "
+        "out of the training target. Overrides the model config.",
+    )
+    parser.add_argument(
+        "--resample-degrade",
+        type=str2bool,
+        default=False,
+        help="Band-limit by really resampling the waveform and re-extracting "
+        "the mel, instead of pushing the mel bins above the cutoff to the "
+        "empty-bin floor. The floor is 8.7 log-units away from what a resampled "
+        "file actually produces, and the evaluation prompts are resampled "
+        "files, so this removes a train/test mismatch. Requires audio in the "
+        "batch, which it switches on.",
+    )
+    # Charging the branch for what its writes do outside the band it writes.
+    #
+    # The residual is added to a velocity, so the solver carries it into the
+    # next state and the frozen backbone -- which reads the whole spectrum --
+    # answers in every bin, including the ones the branch is masked out of.
+    # That off-diagonal response is where the speaker similarity goes, and no
+    # earlier arm had a gradient into it. See ``forward``'s drift block.
+    parser.add_argument(
+        "--drift-loss-weight",
+        type=float,
+        default=0.0,
+        help="Weight on the low-band component of the backbone's response to "
+        "the branch's own residual. 0 skips the term and its extra backbone "
+        "forward entirely.",
+    )
+    parser.add_argument(
+        "--drift-dt",
+        type=float,
+        default=0.5,
+        help="Finite-difference step the residual is probed at. The backbone's "
+        "low-band response is linear in the perturbation -- measured flat to "
+        "within 1% from 1/16 to 2 in fp32 -- so this trades no accuracy and is "
+        "set by --use-fp16 instead: at 1/16 the difference is smaller than "
+        "fp16's spacing at |v|~1 and rounding inflates the term 2.9x, which "
+        "falls to 1.02x at 0.5.",
+    )
+
+    parser.add_argument(
+        "--drift-normalize",
+        type=str2bool,
+        default=False,
+        help="Divide the drift term by the mean square residual over the "
+        "written band, making it the gain along the residual rather than the "
+        "response's size. The unnormalised term is quadratic in the residual, "
+        "so writing less lowers it as surely as aiming better, and writing "
+        "less is the cheaper move: at matched steps the termed branch drove "
+        "2.1-2.3x weaker than the untermed one and reached +0.76 dB of band "
+        "energy against its +11.6 dB. Normalising is invariant to the "
+        "residual's scale, so only its direction is charged: with the "
+        "denominator attached the radial part of the gradient is exactly "
+        "zero, so descent rotates the residual without lengthening or "
+        "shortening it. The denominator is floored at 1e-4 rather than "
+        "detached -- detaching restores a radial component pointing along "
+        "+r, i.e. a brake with an adaptive weight, while the floor only "
+        "stops 1/|r|^2 diverging if the branch collapses.",
+    )
+
+    parser.add_argument(
+        "--rollout-steps",
+        type=int,
+        default=0,
+        help="Size of the Euler grid the training state is rolled out on. 0 "
+        "keeps the flow-matching path, which is the default and every arm up "
+        "to here. Above 0, the state handed to the loss is produced by running "
+        "the solver from noise under no_grad, so the branch conditions on its "
+        "own accumulated writes instead of on a state that already carries the "
+        "target's high band. The rollout is detached -- no gradient flows "
+        "through the solve -- so the cost is k extra forwards of wall clock and "
+        "one activation peak of memory, not k.",
+    )
+
+    parser.add_argument(
+        "--rollout-k",
+        type=int,
+        default=-1,
+        help="How many of those steps to take before the loss is charged. -1 "
+        "draws it uniformly from 1..rollout_steps-1 each batch, which is what a "
+        "training arm wants; a fixed value pins the state to one point on the "
+        "trajectory, which is what a diagnostic wants. Capped at "
+        "rollout_steps-1 so the velocity target does not divide by zero.",
+    )
+
+    parser.add_argument(
+        "--rollout-prob",
+        type=float,
+        default=1.0,
+        help="Fraction of batches that use a rolled-out state; the rest use the "
+        "flow-matching path. Below 1.0 this is scheduled sampling: a branch "
+        "trained on self-generated states alone can settle into writing nothing "
+        "-- the state then has nothing either, so the target is unreachable and "
+        "the gradient is poor, which is how the earlier rollout arm collapsed "
+        "the written band to +1.9 dB over stock.",
+    )
+
+    parser.add_argument(
+        "--rollout-decouple",
+        type=str2bool,
+        default=False,
+        help="""Roll the whole solve out with the branch decoupled: it reads the
+        backbone's hidden state at every step and its writes never re-enter what
+        the backbone reads. The low band is then the frozen model's exactly, and
+        the losses score the sample the solver returns rather than a one-step
+        estimate. Requires --rollout-steps. fm_loss is not defined in this mode
+        and reads zero.""",
+    )
+    parser.add_argument(
+        "--band-fill",
+        type=str2bool,
+        default=False,
+        help="""Run the full solve with the branch reading the backbone's hidden
+        state at every step and carrying its own state across them, then take
+        its final read-out as the missing band and add it to the solved mel.
+        The branch predicts no velocity and nothing it writes is integrated, so
+        the dose and tilt knobs have nothing to correct. Requires
+        --rollout-steps. fm_loss is not defined in this mode and reads zero.""",
+    )
+    parser.add_argument(
+        "--band-loss-weight",
+        type=float,
+        default=0.0,
+        help="Weight of the multi-resolution band loss. The reconstruction "
+        "term charges the invented band element by element, and because most "
+        "of that band is not predictable from the low band its L1 optimum is a "
+        "shrunken answer -- measured per octave against ground truth at a 4 kHz "
+        "cutoff, the branch writes the right shape 9-10 dB too quietly. This "
+        "term pools the error over tiles of frames and bins before taking the "
+        "absolute value, so only each tile's net level offset is charged and "
+        "the unpredictable fine structure is not. Default 0.0 leaves the "
+        "objective unchanged.",
+    )
+
+    parser.add_argument(
+        "--use-pretrained-spk",
+        type=str2bool,
+        default=None,
+        help="Condition the branch on the prompt's embedding under the frozen "
+        "pretrained speaker encoder, which is also what the perceptual losses "
+        "use. Requires --speaker-checkpoint. Overrides the model config.",
+    )
 
     parser.add_argument(
         "--curriculum-steps",
         type=int,
         default=30000,
         help="Total number of steps the curriculum is scheduled against.",
+    )
+
+    # The adversarial terms. Off unless a start step is given, so the recipe is
+    # unchanged by default and the discriminators are not even constructed.
+    #
+    # What they are for: the two base terms are both minimised by a conditional
+    # mean, and the dispersion floor only asks that the written bands differ
+    # from each other -- it is permutation-invariant, so swapping two speakers'
+    # high bands scores perfectly. A discriminator scores whether *this* band is
+    # a plausible continuation of *this* observed low band, which is the first
+    # term in the objective that a speaker-generic band loses on.
+    parser.add_argument(
+        "--adapter-gan-start-step",
+        type=int,
+        default=-1,
+        help="Enable the discriminators once batch_idx_train reaches this "
+        "value. A negative value disables them for the whole run, which is the "
+        "default and leaves the objective exactly as it was.",
+    )
+
+    parser.add_argument(
+        "--adapter-adv-loss-weight",
+        type=float,
+        default=0.1,
+        help="Weight of each discriminator view's hinge adversarial loss on the "
+        "endpoint estimate.",
+    )
+
+    parser.add_argument(
+        "--adapter-feat-match-loss-weight",
+        type=float,
+        default=2.0,
+        help="Weight of each discriminator view's feature-matching loss.",
+    )
+
+    parser.add_argument(
+        "--adapter-disc-lr",
+        type=float,
+        default=2e-4,
+        help="AdamW learning rate of the discriminators. Plain AdamW rather "
+        "than ScaledAdam: the per-tensor scale clipping is a poor fit for a "
+        "discriminator, and these parameters never enter the merged model.",
+    )
+
+    parser.add_argument(
+        "--adapter-gan-t-min",
+        type=float,
+        default=0.5,
+        help="Only utterances with flow time at least this are discriminated. "
+        "Below it the endpoint estimate is largely noise, and a discriminator "
+        "trained to call noise fake learns the noise level rather than the "
+        "band. Same argument as --perceptual-t-min, kept separate because the "
+        "two terms can be weighted and gated independently.",
     )
 
     # The perceptual terms. Both default to 0, so the recipe is the two-term
@@ -645,13 +867,131 @@ def get_params() -> AttributeDict:
             "best_train_epoch": -1,
             "best_valid_epoch": -1,
             "batch_idx_train": 0,
-            "log_interval": 50,
+            "log_interval": 5,
             "reset_interval": 200,
             "env_info": get_env_info(),
         }
     )
 
     return params
+
+
+def gan_enabled(params: AttributeDict) -> bool:
+    """Whether the discriminators take part at the current training step."""
+    return (
+        params.adapter_gan_start_step >= 0
+        and params.batch_idx_train >= params.adapter_gan_start_step
+    )
+
+
+def discriminator_states(
+    discriminators: Optional[Union[nn.Module, DDP]],
+    disc_optimizer: Optional[Optimizer],
+) -> Optional[dict]:
+    """The discriminator state to store in a checkpoint, so a resumed run picks
+    the adversarial game back up rather than restarting it against a generator
+    that has moved on."""
+    if discriminators is None:
+        return None
+    module = (
+        discriminators.module if isinstance(discriminators, DDP) else discriminators
+    )
+    return {
+        "discriminators": module.state_dict(),
+        "disc_optimizer": (
+            disc_optimizer.state_dict() if disc_optimizer is not None else None
+        ),
+    }
+
+
+def run_discriminators(
+    discriminators: Union[nn.Module, DDP],
+    mel: Tensor,
+    ctx: dict,
+) -> Tuple[dict, dict]:
+    """Run every discriminator view on one mel, with the shared conditioning."""
+    return discriminators(
+        mel=mel * ctx["frame_mask"],
+        mask=ctx["band_mask"],
+        cutoff_hz=ctx["cutoff_hz"],
+        centers=ctx["centers"],
+        f0=None,
+        voiced=None,
+    )
+
+
+def compute_disc_loss(
+    params: AttributeDict,
+    discriminators: Union[nn.Module, DDP],
+    ctx: dict,
+) -> Tuple[Tensor, MetricsTracker]:
+    """
+    Hinge discriminator loss on the target mel (real) against the branch's
+    endpoint estimate (fake, detached so no gradient reaches the branch).
+
+    Real and fake go through in a single batched forward: DDP's reducer only
+    tolerates one forward per backward, and none of the discriminator stacks
+    carry batch statistics (they use weight norm), so batching them together is
+    numerically identical to two separate passes.
+    """
+    real = ctx["features"]
+    fake = ctx["x1_hat"].detach()
+    batch_size = real.size(0)
+
+    paired_ctx = dict(ctx)
+    for key in ("band_mask", "cutoff_hz", "frame_mask"):
+        value = ctx[key]
+        if value is not None:
+            paired_ctx[key] = torch.cat([value, value], dim=0)
+
+    paired_logits, _ = run_discriminators(
+        discriminators, torch.cat([real, fake], dim=0), paired_ctx
+    )
+    real_logits = {
+        view: [logit[:batch_size] for logit in logits]
+        for view, logits in paired_logits.items()
+    }
+    fake_logits = {
+        view: [logit[batch_size:] for logit in logits]
+        for view, logits in paired_logits.items()
+    }
+
+    # "frames" is deliberately not set here: this tracker is added to the
+    # generator's, which already carries the frame count.
+    info = MetricsTracker()
+    loss = torch.zeros((), device=real.device)
+    for view in real_logits:
+        view_loss = hinge_d_loss(real_logits[view], fake_logits[view])
+        loss = loss + view_loss
+        info[f"d_{view}"] = view_loss.detach().cpu().item() * ctx["num_frames"]
+    info["d_loss"] = loss.detach().cpu().item() * ctx["num_frames"]
+    return loss, info
+
+
+def gan_context(
+    params: AttributeDict,
+    aux: dict,
+    num_frames: int,
+    centers: Tensor,
+) -> Optional[dict]:
+    """The subset of the batch the discriminators see, or None if it is empty.
+
+    Only utterances far enough along the flow qualify, so the tensors are sliced
+    rather than masked -- a discriminator has no per-utterance weight, and
+    feeding it near-noise endpoints with a zero weight is not available.
+    """
+    keep = (aux["t"] >= params.adapter_gan_t_min).nonzero().flatten()
+    if keep.numel() == 0:
+        return None
+    return {
+        "features": aux["features"][keep],
+        "x1_hat": aux["x1_hat"][keep],
+        "band_mask": aux["band_mask"][keep],
+        "cutoff_hz": aux["cutoff_hz"][keep],
+        "frame_mask": aux["frame_mask"][keep],
+        "centers": centers,
+        "num_frames": num_frames,
+    }
 
 
 def compute_fbank_loss(
@@ -662,7 +1002,11 @@ def compute_fbank_loss(
     tokens: List[List[int]],
     is_training: bool,
     perceptual: Optional[nn.Module] = None,
-) -> Tuple[Tensor, MetricsTracker]:
+    discriminators: Optional[Union[nn.Module, DDP]] = None,
+    audio: Optional[Tensor] = None,
+    audio_lens: Optional[Tensor] = None,
+    fbank: Optional[nn.Module] = None,
+) -> Tuple[Tensor, MetricsTracker, Optional[dict]]:
     """
     Compute loss given the model and its inputs.
 
@@ -687,6 +1031,12 @@ def compute_fbank_loss(
         in rather than held on the model or on ``params``: anything on the model
         would enter the checkpoint and the averaged model, and ``params`` is
         written into the checkpoint key by key (``utils/checkpoint.py:110``).
+      discriminators:
+        The discriminator set, or None when the adversarial terms are off.
+
+    Returns the loss, the metrics, and the discriminator context the caller
+    needs for the discriminator's own step -- None when the GAN is off or no
+    utterance in the batch cleared the flow-time gate.
     """
 
     device = model.device if isinstance(model, DDP) else next(model.parameters()).device
@@ -706,6 +1056,56 @@ def compute_fbank_loss(
         )
     num_frames = features_lens.sum().item()
 
+    # Waveform-domain band-limiting. The cutoff has to be drawn here rather than
+    # left to the model, because the degradation needs it before the forward
+    # pass; the model is then handed both, and draws nothing itself.
+    cutoff_hz = None
+    masked_features = None
+    degraded_audio = None
+    if fbank is not None:
+        inner = model.module if isinstance(model, DDP) else model
+        cutoff_hz = sample_cutoff(
+            batch_size=features.size(0),
+            step=params.batch_idx_train,
+            total_steps=params.curriculum_steps,
+            f_min=inner.cutoff_min,
+            f_max=inner.cutoff_max,
+            beta=inner.curriculum_beta,
+            rho=inner.curriculum_rho,
+            full_band_prob=inner.full_band_prob,
+            device=device,
+        )
+        with torch.no_grad():
+            masked_features, degraded_audio = resample_band_limit(
+                audio=audio.to(device),
+                audio_lens=audio_lens.to(device),
+                cutoff_hz=cutoff_hz,
+                fbank=fbank,
+                num_frames=features.size(1),
+                sampling_rate=params.sampling_rate,
+                return_audio=True,
+            )
+            masked_features = masked_features.to(features.dtype) * params.feat_scale
+
+    # Which signal the speaker encoder reads decides whether this conditioning
+    # is a leak. When the degradation ran in the waveform domain, it reads the
+    # degraded waveform -- the real band-limited recording, exactly what the
+    # prompt is at inference -- and never ``batch["audio"]``, which still holds
+    # the band the branch is supposed to invent and which the encoder would
+    # hear, since it resamples to 16 kHz and a 4 kHz cutoff leaves real content
+    # from 4 to 8 kHz. Without waveform degradation it falls back to vocoding
+    # the band-limited mel, which is band-limited by construction.
+    speaker_embedder = None
+    if perceptual is not None:
+        if degraded_audio is not None:
+            speaker_embedder = (
+                lambda condition, prompt_mask: perceptual.embed_audio(
+                    degraded_audio, prompt_mask
+                )
+            )
+        else:
+            speaker_embedder = perceptual.embed_prompt
+
     with torch.set_grad_enabled(is_training):
 
         fm_loss, recon_loss, aux = model(
@@ -715,17 +1115,49 @@ def compute_fbank_loss(
             noise=noise,
             t=t,
             condition_drop_ratio=params.condition_drop_ratio,
+            cutoff_hz=cutoff_hz,
             curriculum_step=params.batch_idx_train,
             curriculum_total=params.curriculum_steps,
             recon_loss_weight=params.recon_loss_weight,
+            masked_features=masked_features,
+            speaker_embedder=speaker_embedder,
+            # The extra backbone forward is a training cost with no bearing on
+            # what validation reports, so it is skipped there.
+            drift_dt=(
+                params.drift_dt
+                if is_training and params.drift_loss_weight > 0.0
+                else 0.0
+            ),
+            drift_normalize=params.drift_normalize,
+            rollout_steps=params.rollout_steps,
+            rollout_k=params.rollout_k,
+            rollout_prob=params.rollout_prob,
+            rollout_decouple=params.rollout_decouple,
+            band_fill=params.band_fill,
         )
-        loss = fm_loss + recon_loss
+        variance_loss = aux["variance_loss"]
+        drift_loss = aux["drift_loss"]
+        band_loss = aux["band_loss"]
+        band_bias = aux["band_bias"]
+        loss = (
+            fm_loss
+            + recon_loss
+            + params.variance_loss_weight * variance_loss
+            + params.drift_loss_weight * drift_loss
+            + params.band_loss_weight * band_loss
+        )
 
         identity_loss = torch.zeros((), device=device)
         fmatch_loss = torch.zeros((), device=device)
         num_perceptual = 0
+        # The weights gate the forward, not just the sum. ``perceptual`` is now
+        # also built for speaker conditioning alone, and in that case these two
+        # losses are dead weight: backprop through the vocoder's ISTFT
+        # overflows under --use-fp16 and drove the gradient scaler to 5.8e-11
+        # and the loss to NaN within 50 steps, for terms multiplied by zero.
         if (
             perceptual is not None
+            and (params.identity_loss_weight > 0.0 or params.fmatch_loss_weight > 0.0)
             and params.batch_idx_train >= params.perceptual_start_step
         ):
             # Only utterances far enough along the flow contribute. Near t=0 the
@@ -750,6 +1182,63 @@ def compute_fbank_loss(
                     + params.fmatch_loss_weight * fmatch_loss
                 )
 
+    inner = model.module if isinstance(model, DDP) else model
+    ctx = None
+    adv_terms = {}
+    # Validation runs this too, under no-grad: the adversarial and
+    # feature-matching terms are the only measure of what the GAN is actually
+    # optimising, and without them valid_loss is not comparable to the training
+    # loss it is meant to track.
+    with torch.set_grad_enabled(is_training):
+        if discriminators is not None and gan_enabled(params):
+            ctx = gan_context(params, aux, num_frames, inner.mel_centers)
+        if ctx is not None:
+            # The unwrapped module: these forwards exist to push gradients back
+            # into the branch, the gradients they leave on the discriminator
+            # parameters are discarded before the discriminator step, and
+            # running them through the DDP wrapper would break its
+            # one-forward-per-backward contract.
+            disc_module = (
+                discriminators.module
+                if isinstance(discriminators, DDP)
+                else discriminators
+            )
+            fake_logits, fake_features = run_discriminators(
+                disc_module, ctx["x1_hat"], ctx
+            )
+            with torch.no_grad():
+                real_logits, real_features = run_discriminators(
+                    disc_module, ctx["features"], ctx
+                )
+
+            for view in fake_logits:
+                adv = hinge_g_loss(fake_logits[view])
+                fmatch = feature_matching_loss(
+                    real_features[view], fake_features[view]
+                )
+                loss = loss + params.adapter_adv_loss_weight * adv
+                loss = loss + params.adapter_feat_match_loss_weight * fmatch
+                info_adv = adv.detach().cpu().item()
+                info_fmatch = fmatch.detach().cpu().item()
+                adv_terms[f"adv_{view}"] = info_adv
+                adv_terms[f"fmatch_{view}"] = info_fmatch
+
+            adv_terms["gan_utts"] = float(ctx["features"].size(0))
+
+            if not is_training:
+                # Training logs d_* from the discriminator's own step, which
+                # validation never takes. Recomputing them from the forwards
+                # just done costs nothing and keeps the key set the same on both
+                # sides, so the two curves are comparable.
+                d_total = 0.0
+                for view in fake_logits:
+                    d_view = hinge_d_loss(real_logits[view], fake_logits[view]).item()
+                    d_total += d_view
+                    adv_terms[f"d_{view}"] = d_view
+                adv_terms["d_loss"] = d_total
+                # Nothing downstream takes a discriminator step in validation.
+                ctx = None
+
     assert loss.requires_grad == is_training
 
     info = MetricsTracker()
@@ -763,6 +1252,17 @@ def compute_fbank_loss(
     # same thing here, so it is on the training curves rather than left to a
     # post-hoc probe.
     info["residual_rms"] = aux["residual_rms"].cpu().item() * num_frames
+    # Logged whatever its weight, so a run that does not pay for it still says
+    # how far the written band falls short of the data's own dispersion.
+    info["variance_loss"] = variance_loss.detach().cpu().item() * num_frames
+    # Zero on validation batches by construction; the training curve is the one
+    # that says whether the branch is learning to stay out of the low band.
+    info["drift_loss"] = drift_loss.detach().cpu().item() * num_frames
+    # Logged whatever its weight. It is a level offset in the feature's own log
+    # units, so a run that pays for it should show this falling while
+    # ``residual_rms`` rises.
+    info["band_loss"] = band_loss.detach().cpu().item() * num_frames
+    info["band_bias"] = band_bias.detach().cpu().item() * num_frames
     if perceptual is not None:
         info["identity_loss"] = identity_loss.detach().cpu().item() * num_frames
         info["fmatch_loss"] = fmatch_loss.detach().cpu().item() * num_frames
@@ -770,14 +1270,18 @@ def compute_fbank_loss(
         # If this sits at zero the two terms above are zero for a reason that
         # has nothing to do with the branch having learned anything.
         info["perceptual_utts"] = num_perceptual * num_frames
+    for name, value in adv_terms.items():
+        info[name] = value * num_frames
 
-    return loss, info
+    return loss, info, ctx
 
 
 def train_one_epoch(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
     optimizer: Optimizer,
+    discriminators: Optional[Union[nn.Module, DDP]],
+    disc_optimizer: Optional[Optimizer],
     scheduler: LRSchedulerType,
     train_dl: torch.utils.data.DataLoader,
     valid_dl: torch.utils.data.DataLoader,
@@ -787,6 +1291,7 @@ def train_one_epoch(
     world_size: int = 1,
     rank: int = 0,
     perceptual: Optional[nn.Module] = None,
+    fbank: Optional[nn.Module] = None
 ) -> None:
     """Train the model for one epoch.
 
@@ -818,6 +1323,8 @@ def train_one_epoch(
         be set to 0.
     """
     model.train()
+    if discriminators is not None:
+        discriminators.train()
     device = model.device if isinstance(model, DDP) else next(model.parameters()).device
 
     # used to track the stats over iterations in one epoch
@@ -836,6 +1343,7 @@ def train_one_epoch(
             sampler=train_dl.sampler,
             scaler=scaler,
             rank=0,
+            extra_states=discriminator_states(discriminators, disc_optimizer),
         )
 
     for batch_idx, batch in enumerate(train_dl):
@@ -850,6 +1358,7 @@ def train_one_epoch(
             params.valid_by_epoch and batch_idx == 0 and not params.print_diagnostics
         ) or (
             not params.valid_by_epoch
+            and params.batch_idx_train > 0
             and params.batch_idx_train % params.valid_interval == 0
             and not params.print_diagnostics
         ):
@@ -860,8 +1369,12 @@ def train_one_epoch(
                 valid_dl=valid_dl,
                 world_size=world_size,
                 perceptual=perceptual,
+                discriminators=discriminators,
+                fbank=fbank,
             )
             model.train()
+            if discriminators is not None:
+                discriminators.train()
             logging.info(
                 f"Epoch {params.cur_epoch}, global_batch_idx: {params.batch_idx_train},"
                 f" validation: {valid_info}"
@@ -879,17 +1392,28 @@ def train_one_epoch(
 
         batch_size = len(batch["text"])
 
-        tokens, features, features_lens = prepare_input(
+        tokens, features, features_lens, audio, audio_lens = prepare_input(
             params=params,
             batch=batch,
             device=device,
             return_tokens=True,
             return_feature=True,
+            return_audio=True,
+        ) if fbank is not None else (
+            *prepare_input(
+                params=params,
+                batch=batch,
+                device=device,
+                return_tokens=True,
+                return_feature=True,
+            ),
+            None,
+            None,
         )
 
         try:
             with torch_autocast(dtype=torch.float16, enabled=params.use_fp16):
-                loss, loss_info = compute_fbank_loss(
+                loss, loss_info, ctx = compute_fbank_loss(
                     params=params,
                     model=model,
                     features=features,
@@ -897,11 +1421,31 @@ def train_one_epoch(
                     tokens=tokens,
                     is_training=True,
                     perceptual=perceptual,
+                    discriminators=discriminators,
+                    audio=audio,
+                    audio_lens=audio_lens,
+                    fbank=fbank,
                 )
+
+                train_disc = ctx is not None
+                if train_disc:
+                    disc_loss, disc_info = compute_disc_loss(
+                        params=params,
+                        discriminators=discriminators,
+                        ctx=ctx,
+                    )
+                    loss_info = loss_info + disc_info
 
             tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
 
             scaler.scale(loss).backward()
+
+            if train_disc:
+                # The generator's loss ran the discriminators and left gradients
+                # on their parameters. Discard those before computing the
+                # discriminators' own.
+                disc_optimizer.zero_grad()
+                scaler.scale(disc_loss).backward()
 
             scheduler.step_batch(params.batch_idx_train)
             # Use the number of hours of speech to adjust the learning rate
@@ -913,9 +1457,13 @@ def train_one_epoch(
                     / 3600
                 )
             scaler.step(optimizer)
+            if train_disc:
+                scaler.step(disc_optimizer)
             # A single update() per iteration, after every step().
             scaler.update()
             optimizer.zero_grad()
+            if train_disc:
+                disc_optimizer.zero_grad()
         except Exception as e:
             logging.info(f"Caught exception : {e}.")
             save_bad_model()
@@ -950,6 +1498,7 @@ def train_one_epoch(
                 sampler=train_dl.sampler,
                 scaler=scaler,
                 rank=rank,
+                extra_states=discriminator_states(discriminators, disc_optimizer),
             )
             remove_checkpoints(
                 out_dir=params.exp_dir,
@@ -989,7 +1538,20 @@ def train_one_epoch(
                 f"batch size: {batch_size}, "
                 f"loss[{loss_info}], tot_loss[{tot_loss}], "
                 f"cur_lr: {cur_lr:.2e}, "
-                + (f"grad_scale: {scaler._scale.item()}" if params.use_fp16 else "")
+                + (f"grad_scale: {scaler._scale.item()}, " if params.use_fp16 else "")
+                # On the log line rather than only at validation, because with
+                # --valid-interval set high the validation line never prints and
+                # the only evidence of a memory problem is the OOM itself. Both
+                # numbers, because they answer different questions: `alloc` is
+                # what is live right now and rises only if something is being
+                # retained across batches, while `peak` is the high-water mark
+                # of the forward and rises with batch shape alone.
+                + (
+                    f"alloc: {torch.cuda.memory_allocated() // 1000000}MB, "
+                    f"peak: {torch.cuda.max_memory_allocated() // 1000000}MB"
+                    if torch.cuda.is_available()
+                    else ""
+                )
             )
 
             if tb_writer is not None:
@@ -1020,25 +1582,40 @@ def compute_validation_loss(
     valid_dl: torch.utils.data.DataLoader,
     world_size: int = 1,
     perceptual: Optional[nn.Module] = None,
+    discriminators: Optional[Union[nn.Module, DDP]] = None,
+    fbank: Optional[nn.Module] = None
 ) -> MetricsTracker:
     """Run the validation process."""
 
     model.eval()
+    if discriminators is not None:
+        discriminators.eval()
     device = model.device if isinstance(model, DDP) else next(model.parameters()).device
 
     # used to summary the stats over iterations
     tot_loss = MetricsTracker()
 
     for batch_idx, batch in enumerate(valid_dl):
-        tokens, features, features_lens = prepare_input(
+        tokens, features, features_lens, audio, audio_lens = prepare_input(
             params=params,
             batch=batch,
             device=device,
             return_tokens=True,
             return_feature=True,
+            return_audio=True,
+        ) if fbank is not None else (
+            *prepare_input(
+                params=params,
+                batch=batch,
+                device=device,
+                return_tokens=True,
+                return_feature=True,
+            ),
+            None,
+            None,
         )
 
-        loss, loss_info = compute_fbank_loss(
+        loss, loss_info, _ = compute_fbank_loss(
             params=params,
             model=model,
             features=features,
@@ -1046,6 +1623,10 @@ def compute_validation_loss(
             tokens=tokens,
             is_training=False,
             perceptual=perceptual,
+            discriminators=discriminators,
+            audio=audio,
+            audio_lens=audio_lens,
+            fbank=fbank,
         )
         assert loss.requires_grad is False
         tot_loss = tot_loss + loss_info
@@ -1096,6 +1677,7 @@ def scan_pessimistic_batches_for_oom(
     optimizer: torch.optim.Optimizer,
     params: AttributeDict,
     perceptual: Optional[nn.Module] = None,
+    fbank: Optional[nn.Module] = None
 ):
     from lhotse.dataset import find_pessimistic_batches
 
@@ -1107,17 +1689,28 @@ def scan_pessimistic_batches_for_oom(
     batches, crit_values = find_pessimistic_batches(train_dl.sampler)
     for criterion, cuts in batches.items():
         batch = train_dl.dataset[cuts]
-        tokens, features, features_lens = prepare_input(
+        tokens, features, features_lens, audio, audio_lens = prepare_input(
             params=params,
             batch=batch,
             device=device,
             return_tokens=True,
             return_feature=True,
+            return_audio=True,
+        ) if fbank is not None else (
+            *prepare_input(
+                params=params,
+                batch=batch,
+                device=device,
+                return_tokens=True,
+                return_feature=True,
+            ),
+            None,
+            None,
         )
         try:
             with torch_autocast(dtype=torch.float16, enabled=params.use_fp16):
 
-                loss, loss_info = compute_fbank_loss(
+                loss, loss_info, _ = compute_fbank_loss(
                     params=params,
                     model=model,
                     features=features,
@@ -1125,6 +1718,9 @@ def scan_pessimistic_batches_for_oom(
                     tokens=tokens,
                     is_training=True,
                     perceptual=perceptual,
+                    audio=audio,
+                    audio_lens=audio_lens,
+                    fbank=fbank,
                 )
             loss.backward()
             optimizer.zero_grad()
@@ -1182,8 +1778,10 @@ def run(rank, world_size, args):
     # missing one of its streams.
     model_config["adapter"] = adapter_kwargs(
         model_config,
-        use_f0_cond=params.use_f0_cond,
+        use_speaker_cond=params.use_speaker_cond,
         use_rate_cond=params.use_rate_cond,
+        use_pretrained_spk=params.use_pretrained_spk,
+        mask_xt=params.mask_xt,
     )
     params.update(model_config["model"])
     params.update(model_config["feature"])
@@ -1193,8 +1791,6 @@ def run(rank, world_size, args):
         setup_dist(rank, world_size, params.master_port)
 
     os.makedirs(f"{params.exp_dir}", exist_ok=True)
-    with open(f"{params.exp_dir}/model.json", "w") as f:
-        json.dump(model_config, f, indent=2)
     copyfile(src=params.token_file, dst=f"{params.exp_dir}/tokens.txt")
     setup_logger(f"{params.exp_dir}/log/log-train")
 
@@ -1203,6 +1799,49 @@ def run(rank, world_size, args):
     else:
         params.device = torch.device("cpu")
     logging.info(f"Device: {params.device}")
+
+    # Built here and kept out of the model on purpose: it holds a 13.5M-parameter
+    # vocoder and a 6.6M-parameter speaker encoder, none of it trainable, and a
+    # checkpoint has to stay the released tensors plus the branch so it can be
+    # merged back onto the released model.
+    perceptual = None
+    if (
+        params.identity_loss_weight > 0.0
+        or params.fmatch_loss_weight > 0.0
+        or model_config["adapter"].get("use_pretrained_spk", False)
+    ):
+        assert params.speaker_encoder_checkpoint, (
+            "--identity-loss-weight, --fmatch-loss-weight or "
+            "--use-pretrained-spk is set but --speaker-encoder-checkpoint is "
+            "empty"
+        )
+        perceptual = SpeakerPerceptual(
+            speaker_checkpoint=params.speaker_encoder_checkpoint,
+            vocos_local_path=params.vocos_local_path or None,
+            feat_scale=params.feat_scale,
+        ).to(params.device)
+        logging.info(
+            f"Perceptual losses on: identity {params.identity_loss_weight}, "
+            f"fmatch {params.fmatch_loss_weight}, "
+            f"t >= {params.perceptual_t_min}, "
+            f"at most {params.perceptual_max_utts} utterances per step"
+        )
+
+    if perceptual is not None and model_config["adapter"].get(
+        "use_pretrained_spk", False
+    ):
+        # The embedding width is a property of the checkpoint, not a number the
+        # recipe gets to choose; the config's value is overwritten with what the
+        # encoder actually returns so the branch's projection cannot be built
+        # the wrong size.
+        model_config["adapter"]["pretrained_spk_dim"] = perceptual.speaker_dim
+        logging.info(f"Speaker conditioning width {perceptual.speaker_dim}")
+
+    # Written only now, because the block above resolves the speaker width that
+    # sizes the branch. Model averaging and inference build from this copy.
+    with open(f"{params.exp_dir}/model.json", "w") as f:
+        json.dump(model_config, f, indent=2)
+
 
     if params.tokenizer == "emilia":
         tokenizer = EmiliaTokenizer(token_file=params.token_file)
@@ -1257,6 +1896,25 @@ def run(rank, world_size, args):
     num_param = sum([p.numel() for p in model.parameters()])
     logging.info(f"Number of parameters : {num_param}")
 
+    # Built outside the model, like the perceptual module and for the same
+    # reason: a checkpoint has to stay the released tensors plus the branch so it
+    # can be merged back onto the released model. The discriminators ride in the
+    # checkpoint's extra states instead, which the averaged model never sees.
+    discriminators: Optional[nn.Module] = None
+    if params.adapter_gan_start_step >= 0:
+        discriminators = BweDiscriminators(
+            n_mels=model_config["model"]["feat_dim"],
+            # No harmonic view: it needs F0, and the only F0 available here
+            # would come from the band-limited mel, which is the same signal the
+            # branch is already conditioned on.
+            use_harmonic=False,
+            **model_config.get("adapter_disc", {}),
+        )
+        logging.info(
+            "Number of discriminator parameters : "
+            f"{sum(p.numel() for p in discriminators.parameters())}"
+        )
+
     model_avg: Optional[nn.Module] = None
     if rank == 0:
         # model_avg is only used with rank 0
@@ -1281,6 +1939,9 @@ def run(rank, world_size, args):
                 f"Resuming from {params.resume_from} at epoch "
                 f"{params.start_epoch}, batch_idx_train {params.batch_idx_train}"
             )
+        if discriminators is not None and "discriminators" in checkpoints:
+            logging.info("Loading discriminator state dict")
+            discriminators.load_state_dict(checkpoints["discriminators"])
 
     # After the model_avg deepcopy, so that the averaged copy still carries every
     # tensor, and before the optimiser is built, because
@@ -1298,27 +1959,14 @@ def run(rank, world_size, args):
 
     model = model.to(params.device)
 
-    # Built here and kept out of the model on purpose: it holds a 13.5M-parameter
-    # vocoder and a 6.6M-parameter speaker encoder, none of it trainable, and a
-    # checkpoint has to stay the released tensors plus the branch so it can be
-    # merged back onto the released model.
-    perceptual = None
-    if params.identity_loss_weight > 0.0 or params.fmatch_loss_weight > 0.0:
-        assert params.speaker_encoder_checkpoint, (
-            "--identity-loss-weight or --fmatch-loss-weight is set but "
-            "--speaker-encoder-checkpoint is empty"
-        )
-        perceptual = SpeakerPerceptual(
-            speaker_checkpoint=params.speaker_encoder_checkpoint,
-            vocos_local_path=params.vocos_local_path or None,
-            feat_scale=params.feat_scale,
-        ).to(params.device)
-        logging.info(
-            f"Perceptual losses on: identity {params.identity_loss_weight}, "
-            f"fmatch {params.fmatch_loss_weight}, "
-            f"t >= {params.perceptual_t_min}, "
-            f"at most {params.perceptual_max_utts} utterances per step"
-        )
+    # The mel extractor, when band-limiting is done by really resampling. It is
+    # the same ``MelSpectrogram`` the precomputed features were made with, so
+    # the observed band of the degraded mel agrees with them; measured, the
+    # below-cutoff L1 between the two is 0.01 log-units.
+    fbank = None
+    if params.resample_degrade:
+        fbank = VocosFbank().fbank.to(params.device)
+        logging.info("Band-limiting by waveform resampling, not by mel floor")
 
     if world_size > 1:
         logging.info("Using DDP")
@@ -1333,6 +1981,28 @@ def run(rank, world_size, args):
         lr=params.base_lr,  # should have no effect
         clipping_scale=2.0,
     )
+
+    disc_optimizer: Optional[Optimizer] = None
+    if discriminators is not None:
+        discriminators = discriminators.to(params.device)
+        if world_size > 1:
+            discriminators = DDP(discriminators, device_ids=[rank])
+        # Plain AdamW rather than ScaledAdam: ScaledAdam's per-tensor scale
+        # clipping is a poor fit for a GAN discriminator.
+        disc_optimizer = torch.optim.AdamW(
+            discriminators.parameters(),
+            lr=params.adapter_disc_lr,
+            betas=(0.8, 0.99),
+        )
+        if checkpoints is not None and checkpoints.get("disc_optimizer") is not None:
+            logging.info("Loading discriminator optimizer state dict")
+            disc_optimizer.load_state_dict(checkpoints["disc_optimizer"])
+        logging.info(
+            f"Adversarial terms on from step {params.adapter_gan_start_step}: "
+            f"adv {params.adapter_adv_loss_weight}, "
+            f"fmatch {params.adapter_feat_match_loss_weight}, "
+            f"t >= {params.adapter_gan_t_min}"
+        )
 
     assert params.lr_hours >= 0
 
@@ -1450,6 +2120,7 @@ def run(rank, world_size, args):
             optimizer=optimizer,
             params=params,
             perceptual=perceptual,
+            fbank=fbank,
         )
 
     logging.info("Training started")
@@ -1472,6 +2143,8 @@ def run(rank, world_size, args):
             model=model,
             model_avg=model_avg,
             optimizer=optimizer,
+            discriminators=discriminators,
+            disc_optimizer=disc_optimizer,
             scheduler=scheduler,
             train_dl=train_dl,
             valid_dl=valid_dl,
@@ -1480,6 +2153,7 @@ def run(rank, world_size, args):
             world_size=world_size,
             rank=rank,
             perceptual=perceptual,
+            fbank=fbank,
         )
 
         if params.num_iters > 0 and params.batch_idx_train > params.num_iters:
@@ -1500,6 +2174,7 @@ def run(rank, world_size, args):
             sampler=train_dl.sampler,
             scaler=scaler,
             rank=rank,
+            extra_states=discriminator_states(discriminators, disc_optimizer),
         )
 
         if rank == 0:
@@ -1523,6 +2198,12 @@ def main():
     TtsDataModule.add_arguments(parser)
     args = parser.parse_args()
     args.exp_dir = Path(args.exp_dir)
+    if args.resample_degrade:
+        # Degrading by resampling needs the waveform, not just the precomputed
+        # feature. Forced rather than asserted: the two flags are one decision,
+        # and a run that silently fell back to the mel floor would look like a
+        # resampling run in the log.
+        args.return_audio = True
 
     world_size = args.world_size
     assert world_size >= 1

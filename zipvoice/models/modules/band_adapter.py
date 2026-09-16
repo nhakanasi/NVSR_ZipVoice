@@ -32,16 +32,25 @@ sequence and self-attention runs along the frequency axis, independently per
 frame, letting an observed low band speak directly to the bins that have to be
 invented above it.
 
-:class:`F0Encoder` is an optional stream carrying the prompt's pitch track, and
-:class:`RateEncoder` an optional stream carrying the cutoff frequency as a
-number rather than only as the shape of a mask.
+:class:`SpeakerEncoder` is an optional stream carrying the prompt's time-pooled
+spectral statistics, and :class:`RateEncoder` an optional stream carrying the
+cutoff frequency as a number rather than only as the shape of a mask.
+
+A stream carrying a pitch track was tried and removed. It cost 0.087 to 0.231
+SIM-o at every cutoff against a 0.008 noise floor, for no UTMOS gain, and the
+training objective could not see it: validation was identical on all three
+terms. Pitch is cheap, reliable and *not identifying*, so conditioned on it the
+branch can write the conditional mean over every speaker at that pitch, which
+both loss terms accept -- both are minimised by a conditional mean -- and which
+is by construction the least speaker-specific band available. The lesson is in
+what is admitted here now: a stream must carry speaker identity, or it hands
+the branch a way to satisfy the objective without carrying any.
 
 :class:`BandAdapter` is the ControlNet-style branch proper: the concatenated
 stream output is cross-attended by the frozen backbone's own hidden state and
 read out to one velocity residual per mel bin.
 """
 
-import math
 from typing import Optional
 
 import torch
@@ -49,7 +58,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from zipvoice.models.modules.bwe_discriminators import f0_from_mel
 from zipvoice.models.modules.zipformer import timestep_embedding
 
 
@@ -194,82 +202,65 @@ class FrequencyEncoder(nn.Module):
         return self.out_proj(x)
 
 
-class F0Encoder(nn.Module):
-    """The prompt's pitch track, as a per-frame stream.
+class SpeakerEncoder(nn.Module):
+    """The prompt's time-pooled spectral statistics, broadcast over time.
 
-    F0 is estimated from the band-limited condition mel rather than from audio.
-    That is not a convenience: training band-limits only in the mel domain, so
-    the waveform in the batch is clean and full band, and any pitch tracker run
-    on it would be reading the high band the branch exists to invent. The mel is
-    degraded by construction, so it cannot leak. Nor does the degradation cost
-    anything here -- F0 lives in 60-400 Hz and the lowest cutoff trained is 1000
-    Hz, so no fundamental and few comb harmonics are ever removed.
+    This is the stream that replaced the pitch track, and the reason for the
+    swap is the module docstring's: a conditioning stream that is informative
+    but not identifying lets the branch satisfy the objective with a conditional
+    mean, which is exactly the band that scores worst on speaker similarity.
+    The statistics here are identifying by construction -- they are the
+    speaker's own average spectrum and its variation -- so using them *is*
+    carrying identity rather than a way around it.
 
-    Only the prompt contributes. The generated span of the condition is zeroed
-    before it arrives, so a pitch estimate there would be a harmonic comb scored
-    against silence, and were it not zeroed it would be ground truth the model
-    does not have at inference.
+    Per mel bin, over the prompt frames only: the mean and the standard
+    deviation of the band-limited condition. The mean is the long-term average
+    spectrum, which carries the speaker's timbre and the recording chain's
+    signature together; the deviation says how much each bin moves, separating
+    a bin held at a steady level from one that swings. One further channel says
+    whether the prompt was non-empty at all, since ``condition_time_mask`` draws
+    it as 0-30% of the utterance and it is regularly empty, and then the
+    statistics are zero for a reason the branch could not otherwise distinguish
+    from a silent prompt.
 
-    Four values per frame:
+    The branch's cross-attention already pools over the utterance and could in
+    principle form these itself. It has not had to: two attention layers whose
+    queries come from the backbone are a poor place to compute a masked mean
+    over several hundred frames, and the measured result is a branch that loses
+    speaker similarity at every bandwidth. Computing it directly costs one
+    reduction.
 
-    0. ``voiced``, 0 or 1.
-    1. log F0, normalised to roughly [0, 1] over the tracker's own range.
-    2. the same value minus this utterance's mean over its voiced prompt frames:
-       where the speaker sits relative to their own register, which is what a
-       high band correlates with, rather than where they sit on an absolute
-       scale shared with every other speaker.
-    3. ``in_prompt``, 0 or 1. Without it an unvoiced prompt frame and a frame
-       outside the prompt are both all-zero and indistinguishable -- the same
-       argument :class:`FrequencyEncoder` makes for its observed-bin channel.
-       It matters: ``condition_time_mask`` draws the prompt as 0-30% of the
-       utterance, so the prompt is regularly empty, and then this stream
-       contributes its bias and nothing else.
+    Nothing here is a leak. The statistics are taken from the band-limited
+    condition, the same tensor the frequency encoder reads, so they describe
+    only the observed band; the high band remains something the branch must
+    infer from the speaker's low band rather than something it is shown.
     """
 
-    def __init__(
-        self,
-        out_dim: int = 64,
-        dim: int = 64,
-        f0_min: float = 60.0,
-        f0_max: float = 400.0,
-    ):
+    def __init__(self, num_bins: int, out_dim: int = 128, dim: int = 256):
         super().__init__()
-        self.f0_min = f0_min
-        self.f0_max = f0_max
-        self.in_proj = nn.Linear(4, dim)
-        self.out_proj = nn.Linear(dim, out_dim)
+        self.num_bins = num_bins
+        self.net = nn.Sequential(
+            nn.Linear(2 * num_bins + 1, dim),
+            nn.SiLU(),
+            nn.Linear(dim, out_dim),
+        )
 
-    def forward(
-        self, condition: Tensor, prompt_mask: Tensor, centers: Tensor
-    ) -> Tensor:
+    def forward(self, condition: Tensor, prompt_mask: Tensor) -> Tensor:
         """
         Args:
           condition: the band-limited, prompt-masked condition mel, (B, T, F).
           prompt_mask: True at frames belonging to the prompt, (B, T).
-          centers: mel filter centre frequencies, (F,).
         Returns:
-          (B, T, out_dim).
+          (B, T, out_dim), constant along time.
         """
         dtype = condition.dtype
-        keep = prompt_mask.to(dtype)
-        f0, voiced = f0_from_mel(
-            condition.float(), centers, f0_min=self.f0_min, f0_max=self.f0_max
-        )
-        voiced = voiced.to(dtype) * keep
-        span = math.log(self.f0_max / self.f0_min)
-        log_f0 = (f0.clamp(min=self.f0_min).log() - math.log(self.f0_min)) / span
-        log_f0 = log_f0.to(dtype) * voiced
-
-        # Mean over this utterance's voiced prompt frames. An utterance with no
-        # such frame -- an empty prompt, or an entirely unvoiced one -- gets a
-        # mean of zero, which leaves channel 2 zero alongside channels 0 and 1
-        # rather than producing a NaN.
-        count = voiced.sum(dim=1, keepdim=True)
-        mean = log_f0.sum(dim=1, keepdim=True) / count.clamp(min=1.0)
-        centred = (log_f0 - mean) * voiced
-
-        tokens = torch.stack([voiced, log_f0, centred, keep], dim=-1)
-        return self.out_proj(F.silu(self.in_proj(tokens)))
+        keep = prompt_mask.to(dtype).unsqueeze(-1)
+        count = keep.sum(dim=1).clamp(min=1.0)
+        mean = (condition * keep).sum(dim=1) / count
+        var = ((condition - mean.unsqueeze(1)) ** 2 * keep).sum(dim=1) / count
+        has_prompt = (prompt_mask.any(dim=1, keepdim=True)).to(dtype)
+        stats = torch.cat([mean, var.clamp(min=1e-8).sqrt(), has_prompt], dim=-1)
+        return self.net(stats).unsqueeze(1).expand(-1, condition.size(1), -1)
 
 
 class RateEncoder(nn.Module):
@@ -410,16 +401,26 @@ class BandAdapter(nn.Module):
         hidden: Tensor,
         cond: Tensor,
         padding_mask: Optional[Tensor] = None,
-    ) -> Tensor:
+        state: Optional[Tensor] = None,
+        return_state: bool = False,
+    ):
         """hidden: (B, T, query_dim), cond: (B, T, cond_dim) -> (B, T, out_bins).
 
         ``padding_mask`` is True at padded frames and keeps them out of the
         attention's keys, where they would otherwise contribute a learned bias
         to every real frame's output.
+
+        ``state`` carries the branch's own representation across solver steps.
+        Called once per step with the state it returned last time, the branch
+        accumulates the backbone's hidden output over the whole trajectory
+        instead of seeing a single step of it, and each step's cross-attention
+        refines what it has accumulated. ``None`` is the single-step behaviour
+        every arm before this was trained under: the state is just this step's
+        projected hidden.
         """
         c = self.cond_in(cond)
         c = self.encoder(c.transpose(1, 2)).transpose(1, 2)
-        state = self.q_proj(hidden)
+        state = self.q_proj(hidden) if state is None else state + self.q_proj(hidden)
         for q_norm, kv_norm, attn, conv in zip(
             self.q_norm, self.kv_norm, self.attn, self.out_convs
         ):
@@ -431,4 +432,8 @@ class BandAdapter(nn.Module):
                 need_weights=False,
             )
             state = state + conv(delta.transpose(1, 2)).transpose(1, 2)
-        return self.out_proj(self.norm(state))
+        # ``norm`` is what keeps the read-out stable while the state grows: the
+        # accumulation above is linear in the number of steps, so without it a
+        # 16-step carry would read out roughly 16x a 1-step one.
+        out = self.out_proj(self.norm(state))
+        return (out, state) if return_state else out
