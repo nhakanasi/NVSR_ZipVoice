@@ -413,6 +413,18 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--project-low-band",
+        type=str2bool,
+        default=False,
+        help="zipvoice_adapter only: integrate a second trajectory with the "
+        "branch inert, from the same noise on the same timestep grid, and after "
+        "every Euler step give the adapter's state back that trajectory's low "
+        "band. The constraint is not the prompt -- it is the low band the frozen "
+        "model would itself have generated for this text. Inference-only; a test "
+        "of whether the low-band damage is state coupling or velocity.",
+    )
+
+    parser.add_argument(
         "--band-fill",
         type=str2bool,
         default=False,
@@ -1140,6 +1152,7 @@ def main():
         )
         model.decouple_residual = params.decouple_residual
         model.band_fill = params.band_fill
+        model.project_low_band = params.project_low_band
 
     if str(model_ckpt).endswith(".safetensors"):
         safetensors.torch.load_model(model, model_ckpt)

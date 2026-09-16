@@ -193,6 +193,11 @@ class ZipVoiceAdapter(ZipVoice):
         # ``forward_fm_decoder``; the two buffers are per-``sample`` state and
         # are cleared there.
         self.decouple_residual = False
+        # State-level projection, inference-only. See ``_projected_sample``.
+        self.project_low_band = False
+        # Filled by ``_projected_sample``: one row per ODE step, read by the
+        # caller to see when the low-band divergence appears.
+        self.project_trace = None
         # Set by ``forward`` around its decoder call when the drift term is on.
         # The term is a finite difference between two backbone forwards, and the
         # backbone has dropout and stochastic depth, so without pinning the
@@ -1233,6 +1238,90 @@ class ZipVoiceAdapter(ZipVoice):
     # Inference
     # ------------------------------------------------------------------
 
+    @torch.no_grad()
+    def _projected_sample(
+        self,
+        x: torch.Tensor,
+        band_mask: torch.Tensor,
+        num_step: int,
+        guidance_scale: float,
+        t_shift: float,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Euler solve that pins the low band to the frozen model's own solve.
+
+        Two trajectories are integrated from the *same* noise on the *same*
+        timestep grid: a reference one with the branch inert, and the adapter's.
+        After each Euler step the adapter state takes the reference's low band
+        back:
+
+            x_adapter <- M_L * x_reference + M_H * x_adapter
+
+        with ``M_H`` the write mask, so the blend boundary is exactly where the
+        branch is allowed to write and the ramp is shared. The constraint is not
+        the prompt -- the prompt is a different utterance and has no low band for
+        *this* text. It is the low band the frozen backbone would itself have
+        generated here, which is the only trusted reference this task has.
+
+        The reference call passes an all-zero ``band_mask``: the residual is
+        multiplied by ``_write_mask`` of it, so the branch contributes exactly
+        zero and the velocity is the backbone's, identical to the dose-0 arm.
+
+        ``project_trace`` records, per step, the low- and high-band norms of the
+        divergence measured *before* the projection, which is where the damage
+        accumulates if the state coupling is what causes it.
+        """
+        assert not self.decouple_residual, (
+            "projection and decoupling are two answers to the same question; "
+            "running both makes the result uninterpretable"
+        )
+        assert not self.band_fill, "band-fill writes after the solve, not during"
+
+        timesteps = get_time_steps(
+            t_start=0.0,
+            t_end=1.0,
+            num_step=num_step,
+            t_shift=t_shift,
+            device=x.device,
+        )
+        write = self._write_mask(band_mask)  # (B, 1, F), 1 where branch may write
+        keep = 1.0 - write
+        zero_mask = torch.zeros_like(band_mask)
+
+        x_ref = x
+        x_adp = x
+        trace = []
+        for step in range(num_step):
+            dt = timesteps[step + 1] - timesteps[step]
+            v_ref = self.solver.model(
+                t=timesteps[step],
+                x=x_ref,
+                guidance_scale=guidance_scale,
+                band_mask=zero_mask,
+                **kwargs,
+            )
+            v_adp = self.solver.model(
+                t=timesteps[step],
+                x=x_adp,
+                guidance_scale=guidance_scale,
+                band_mask=band_mask,
+                **kwargs,
+            )
+            x_ref = x_ref + v_ref * dt
+            x_adp = x_adp + v_adp * dt
+            diff = x_adp - x_ref
+            trace.append(
+                (
+                    step,
+                    float(timesteps[step + 1]),
+                    float((diff * keep).pow(2).sum().sqrt()),
+                    float((diff * write).pow(2).sum().sqrt()),
+                )
+            )
+            x_adp = keep * x_ref + write * x_adp
+        self.project_trace = trace
+        return x_adp
+
     def sample(
         self,
         tokens: List[List[int]],
@@ -1314,7 +1403,10 @@ class ZipVoiceAdapter(ZipVoice):
         self._decouple_prev = None
         self._bf_state = None
 
-        x1 = self.solver.sample(
+        solve = (
+            self._projected_sample if self.project_low_band else self.solver.sample
+        )
+        x1 = solve(
             x=x0,
             text_condition=text_condition,
             speech_condition=speech_condition,
