@@ -47,8 +47,17 @@ eval_dir=${data_root}/data/bwe_eval
 results_dir=${exp_root}/results
 eval_model_dir=${download_dir}/tts_eval_models
 
+# Weights that would otherwise be fetched from HuggingFace. The offline bundle
+# sets ZIPVOICE_ASSETS to the folder it ships them in; without it they are read
+# from the download directory the preparation stages write.
+assets_dir=${ZIPVOICE_ASSETS:-${download_dir}}
+backbone_dir=${assets_dir}/zipvoice
+# Vocos, passed by path so inference never calls Vocos.from_pretrained. Empty
+# means "let inference fetch it", which only works with a network.
+vocoder_path=${vocoder_path:-${assets_dir}/vocos-mel-24khz}
+
 tokenizer=emilia
-token_file=${download_dir}/zipvoice/tokens.txt
+token_file=${backbone_dir}/tokens.txt
 
 exp_dir=${exp_dir:-${exp_root}/dual}
 system=${system:-dual}
@@ -59,7 +68,7 @@ base_lr=${base_lr:-0.001}
 # The released checkpoint. Only branch.* is trained; every released tensor is
 # excluded from the optimizer, not merely zero-gradient, because ScaledAdam
 # would otherwise shrink it through weight decay.
-init_checkpoint=${init_checkpoint:-${download_dir}/zipvoice/model.pt}
+init_checkpoint=${init_checkpoint:-${backbone_dir}/model.pt}
 
 # The reconstruction term. Small: flow matching carries the arm, and an L1 on the
 # endpoint is exactly the term whose optimum is the conditional median, which in
@@ -127,6 +136,7 @@ if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ]; then
                   --tokenizer ${tokenizer} \
                   --test-list ${eval_dir}/test_sr${rate}.tsv \
                   --res-dir ${results_dir}/${system}_sr${rate} \
+                  --vocoder-path ${vocoder_path} \
                   --num-step ${num_step}
       done
 fi
