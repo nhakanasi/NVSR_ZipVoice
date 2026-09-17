@@ -245,6 +245,7 @@ class TTSZipformer(nn.Module):
         t: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
         guidance_scale: Optional[Tensor] = None,
+        return_hidden: bool = False,
     ) -> Tuple[Tensor, Tensor]:
         """
         Args:
@@ -257,6 +258,12 @@ class TTSZipformer(nn.Module):
             masked position. May be None.
           guidance_scale:
             The guidance scale in classifier-free guidance of distillation model.
+          return_hidden:
+            If True, also return the encoder state just before the read-out
+            projection, of shape (batch_size, seq_len, encoder_dim). The last
+            encoder stack has downsampling factor 1, so that state is aligned
+            frame for frame with the input and can be attended to directly by a
+            model running on the same grid.
         Returns:
           Return the output embeddings. its shape is
             (batch_size, output_seq_len, encoder_dim)
@@ -288,8 +295,11 @@ class TTSZipformer(nn.Module):
                 src_key_padding_mask=padding_mask,
                 attn_mask=attn_mask,
             )
+        hidden = x
         x = self.out_proj(x)
         x = x.permute(1, 0, 2)
+        if return_hidden:
+            return x, hidden.permute(1, 0, 2)
         return x
 
 

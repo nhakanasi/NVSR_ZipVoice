@@ -221,6 +221,7 @@ class TTSZipformerTwoStream(TTSZipformer):
         x: Tensor,
         t: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
+        return_hidden: bool = False,
     ) -> Tuple[Tensor, Tensor]:
         """
         Args:
@@ -259,6 +260,9 @@ class TTSZipformerTwoStream(TTSZipformer):
                 src_key_padding_mask=padding_mask,
                 attn_mask=attn_mask,
             )
+        hidden = x
         x = self.out_proj[index](x)
         x = x.permute(1, 0, 2)
+        if return_hidden:
+            return x, hidden.permute(1, 0, 2)
         return x

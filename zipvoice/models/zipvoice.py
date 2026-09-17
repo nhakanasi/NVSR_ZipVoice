@@ -140,6 +140,7 @@ class ZipVoice(nn.Module):
         speech_condition: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
         guidance_scale: Optional[torch.Tensor] = None,
+        return_hidden: bool = False,
     ) -> torch.Tensor:
         """Compute velocity.
         Args:
@@ -155,9 +156,14 @@ class ZipVoice(nn.Module):
                 position, with the shape (N, T).
             guidance_scale: The guidance scale in classifier-free guidance,
                 which is a tensor of shape (N, 1, 1) or a tensor of a float.
+            return_hidden: if True, also return the decoder's state just before
+                its read-out, with the shape (batch, seq_len, encoder_dim). A
+                model running alongside this one on the same frame grid can
+                attend to it; see zipvoice.models.zipvoice_dual.
 
         Returns:
-            predicted velocity, with the shape (batch, seq_len, emb_dim).
+            predicted velocity, with the shape (batch, seq_len, emb_dim), and
+            the hidden state alongside it when ``return_hidden`` is set.
         """
 
         xt = torch.cat([xt, text_condition, speech_condition], dim=2)
@@ -178,10 +184,16 @@ class ZipVoice(nn.Module):
                 guidance_scale = guidance_scale.repeat(xt.shape[0])
 
             vt = self.fm_decoder(
-                x=xt, t=t, padding_mask=padding_mask, guidance_scale=guidance_scale
+                x=xt,
+                t=t,
+                padding_mask=padding_mask,
+                guidance_scale=guidance_scale,
+                return_hidden=return_hidden,
             )
         else:
-            vt = self.fm_decoder(x=xt, t=t, padding_mask=padding_mask)
+            vt = self.fm_decoder(
+                x=xt, t=t, padding_mask=padding_mask, return_hidden=return_hidden
+            )
         return vt
 
     def forward_text_embed(
