@@ -45,6 +45,21 @@ eval_rates=${eval_rates:-"4000 8000 16000"}
 # arm is resynthesised at the same step count -- fewer steps degrades every
 # system, so only the gap between them carries the answer.
 num_step=${num_step:-16}
+# Pin the branch's low band to the frozen model's own solve. A second trajectory
+# is integrated with the branch inert, same noise and same timestep grid, and
+# after every Euler step the state's low band is replaced by that trajectory's.
+# The branch then writes only where the prompt is silent, and the backbone reads
+# the same low band it would have read alone, so the branch's writes cannot
+# compound through the solver. Measured: +0.185 / +0.236 / +0.039 SIM-o at the
+# 4k / 8k / 16k prompt rates, which is the whole of the adversarial arm's
+# identity loss. Costs a second backbone forward per step, RTF 0.18 to 0.36.
+#
+# The cost is paid in the band the branch invents, and grows as that band
+# narrows: no energy lost at a 2 kHz cutoff, about half lost at 8 kHz, where
+# most of the branch's gain had come through perturbing the backbone's state.
+# The 16000 prompt rate misses the +10 dB bar either way and is the one cutoff
+# still open. Set project_low_band=0 to solve without it.
+project_low_band=${project_low_band:-1}
 
 wandb=${wandb:-0}
 wandb_project=${wandb_project:-zipvoice-adapter}
@@ -144,7 +159,9 @@ variance_loss_weight=${variance_loss_weight:-0.0}
 # term of roughly 0.09, where the 0.1 it ran at made that same value twice
 # reconstruction.
 #
-#   exp_dir=${exp_root}/adapter_gan  system=adapter_gan  spk=1 rate=1 var=0 gan=0
+# Stage 9 is the arm that uses these, as a finetune off the spkv checkpoint; the
+# defaults below leave the adversarial term off everywhere else
+# (adapter_gan_start_step -1 never fires).
 adapter_gan_start_step=${adapter_gan_start_step:--1}
 adapter_adv_loss_weight=${adapter_adv_loss_weight:-0.02}
 adapter_feat_match_loss_weight=${adapter_feat_match_loss_weight:-2.0}
@@ -231,6 +248,7 @@ if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ]; then
                   --test-list ${eval_dir}/test_sr${rate}.tsv \
                   --res-dir ${results_dir}/${system}_sr${rate} \
                   --speaker-encoder-checkpoint ${speaker_ckpt} \
+                  --project-low-band ${project_low_band} \
                   --num-step ${num_step}
       done
 fi
@@ -553,39 +571,54 @@ if [ ${stage} -le 8 ] && [ ${stop_stage} -ge 8 ]; then
             --exp-dir ${rollout_exp_dir}
 fi
 
-# Stage 9: train the branch on decoupled full solves.
+# Stage 9: finetune the branch adversarially.
 #
-# The branch reads the frozen backbone's hidden state at every solver step and
-# its writes never re-enter what the backbone reads, so the low band of the
-# sample is bit-identical to the frozen model's. Identity is then preserved by
-# construction rather than by a penalty, which matters because ~94% of the
-# adapter's SIM-o loss sits in bins it never writes -- the damage is the
-# feedback, not the written band.
+# This replaces the decoupled-solve stage that occupied this slot. That stage
+# existed to stop the branch's writes from re-entering what the backbone reads,
+# on the reasoning that ~94% of the adapter's SIM-o loss sits in bins it never
+# writes. Projection at inference (--project-low-band, stage 2) answers the same
+# question without training and was measured to answer it in the affirmative, so
+# the stage was removed rather than left as a second route to a settled result.
+# It never completed a run here in any case: the projected solve keeps sixteen
+# backbone activations alive, and at --max-duration 72 it sat at 15.9 GiB and at
+# 36 at 15.5 GiB, both outside this machine's 10-12 GB budget, at roughly 67 h
+# per 10k iterations.
 #
-# Measured at inference on the stage-4 checkpoint, decoupling holds identity
-# almost flat in the dose: SIM-o 0.368 at 1.0 and 0.354 at 2.0, where the
-# coupled branch is already at 0.198 by 1.5. What it does not do is fill the
-# band -- run decoupled, a coupled-trained branch is 20-35 dB emptier than the
-# coupled arm above 3 kHz, because its own writes feeding back is what
-# amplified it across the 16 steps. That is a train/test mismatch, not a
-# property of the architecture, and this stage is the arm that removes it.
+# What this stage is for instead. Every other term in the objective is minimised
+# by a hedged answer. The band above the cutoff is not a function of the band
+# below it, so the L1 optimum is the conditional median, and in the log domain
+# that sits below the energy of any real sample: measured per octave against
+# ground truth, the branch writes the right shape 9-10 dB too quietly. The
+# tile-pooled band loss (stage 7) was built to charge only the level and not the
+# unpredictable fine structure, and it moved the profile by <=0.6 dB -- pooling
+# removes the penalty for wrong fine structure but leaves the incentive to hedge,
+# because recon_loss still runs at full weight beside it.
 #
-# The full solve is affordable here only because of the decoupling. The branch
-# cannot influence the trajectory, so all ${rollout_steps} backbone forwards run
-# without building a graph and only the adapter forwards carry one; the adapter
-# is 256-dim and two layers against a 512-dim 16-layer backbone. Verified: zero
-# backbone parameters accumulate gradient, and the adapter's do.
+# A discriminator scores whether *this* band is a plausible continuation of
+# *this* observed low band, which is the first term in the objective that a
+# hedged or speaker-generic band loses on. Measured at a 4 kHz cutoff it closes
+# the level gap outright: 8-12 kHz at -22.0 dB re the arm's own low band against
+# ground truth's -22.6, where the L1 branch is at -29.8 and even the cascade at
+# -25.8.
 #
-# The point of paying for it is the objective. Every loss in this study so far
-# has scored x1_hat one step from ground-truth features, where the 9-10 dB level
-# deficit does not exist -- the solve manufactures it. Here x1_hat is the sample
-# the solver returns. fm_loss is undefined in this mode and reads zero, so
-# recon_loss and band_loss are the objective.
-decoup_exp_dir=${decoup_exp_dir:-${exp_root}/adapter_decoupsolve}
-decoup_num_iters=${decoup_num_iters:-10000}
+# It costs identity on its own -- SIM-o 0.204 / 0.372 / 0.693 at the three
+# cutoffs, below stock everywhere -- because the branch buys energy by writing a
+# band that is realistic but not this speaker's, and because its writes perturb
+# the backbone's low-band trajectory through the solver. Projection at inference
+# recovers all of it (0.389 / 0.608 / 0.732) at unchanged energy. The two
+# failures are independent and the two fixes compose; neither alone passes.
+#
+# Recorded as it was actually run, from the spkv arm's 30k checkpoint rather
+# than from ${exp_dir}: the conditioning streams are what the discriminator
+# needs to tell speakers apart. adapter_gan_t_min restricts the adversarial term
+# to the second half of the trajectory, where x1_hat is close enough to a sample
+# for a discriminator's judgement to mean anything.
+gan_exp_dir=${gan_exp_dir:-${exp_root}/adapter_gan}
+gan_init=${gan_init:-${exp_root}/adapter_spkv/iter-30000-avg-2.pt}
+gan_num_iters=${gan_num_iters:-10000}
 
 if [ ${stage} -le 9 ] && [ ${stop_stage} -ge 9 ]; then
-      echo "Stage 9: Finetune on decoupled full solves"
+      echo "Stage 9: Finetune the branch adversarially"
       ${PY} -m zipvoice.bin.train_zipvoice_adapter \
             --world-size 1 --use-fp16 1 --max-duration 72 --max-len 20 \
             --model-config conf/zipvoice_adapter.json \
@@ -593,21 +626,29 @@ if [ ${stage} -le 9 ] && [ ${stop_stage} -ge 9 ]; then
             --dataset libritts --manifest-dir ${fbank_dir} \
             --wandb ${wandb} --wandb-project ${wandb_project} \
             --finetune 1 --base-lr 0.0005 \
-            --num-iters ${decoup_num_iters} \
-            --save-every-n 1000 --valid-interval 1000 \
-            --checkpoint ${exp_dir}/iter-${num_iters}-avg-2.pt \
+            --num-iters ${gan_num_iters} \
+            --save-every-n 2000 --valid-interval 2000 \
+            --checkpoint ${gan_init} \
             --adapter-trainable adapter \
-            --curriculum-rho 0.0 --curriculum-steps 0 \
+            --curriculum-rho 0.0 --curriculum-steps ${gan_num_iters} \
             --full-band-prob 0.2 \
-            --rollout-steps 16 \
-            --rollout-decouple 1 \
-            --exp-dir ${decoup_exp_dir}
+            --use-speaker-cond 1 --use-rate-cond 1 \
+            --adapter-gan-start-step 0 \
+            --adapter-gan-t-min 0.5 \
+            --adapter-adv-loss-weight ${adapter_adv_loss_weight} \
+            --adapter-feat-match-loss-weight ${adapter_feat_match_loss_weight} \
+            --adapter-disc-lr ${adapter_disc_lr} \
+            --exp-dir ${gan_exp_dir}
 
       ${PY} -m zipvoice.bin.generate_averaged_model \
-            --iter ${decoup_num_iters} --avg 2 \
+            --iter ${gan_num_iters} --avg 2 \
             --model-name zipvoice_adapter \
-            --exp-dir ${decoup_exp_dir}
+            --exp-dir ${gan_exp_dir}
 fi
+
+# Score that arm with projection, which is the pairing the table reports:
+#   stage=2 stop_stage=3 system=adapter_gan exp_dir=${exp_root}/adapter_gan \
+#         num_iters=10000 bash run_adapter_libritts.sh
 
 # Stage 10: train the branch as a band filler.
 #
