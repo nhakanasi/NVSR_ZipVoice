@@ -29,9 +29,20 @@ import numpy as np
 import torch
 from jiwer import compute_measures
 from tqdm import tqdm
+import transformers.pipelines.automatic_speech_recognition as _asr_pipeline
 from transformers import pipeline
 
 from zipvoice.eval.utils import load_waveform
+
+# This dataset hands the pipeline a decoded numpy array, so no audio decoder is
+# needed. transformers still imports torchcodec first, purely to test whether the
+# input is an AudioDecoder, and that import raises if the torchcodec wheel cannot
+# find its FFmpeg libraries -- which takes down a WER run that never needed it.
+# Report torchcodec as absent in exactly that case.
+try:
+    import torchcodec  # noqa: F401
+except Exception:
+    _asr_pipeline.is_torchcodec_available = lambda: False
 
 
 def get_parser():

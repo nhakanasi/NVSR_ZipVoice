@@ -128,6 +128,14 @@ class TtsDataModule:
             help="Whether to drop last batch. Used by sampler.",
         )
         group.add_argument(
+            "--return-audio",
+            type=str2bool,
+            default=False,
+            help="When enabled, each training batch will have the "
+            "field: batch['audio'] with the waveforms. Needed by recipes "
+            "that compute something from the waveform, e.g. F0.",
+        )
+        group.add_argument(
             "--return-cuts",
             type=str2bool,
             default=False,
@@ -172,6 +180,7 @@ class TtsDataModule:
             if self.args.on_the_fly_feats
             else PrecomputedFeatures(),
             return_cuts=self.args.return_cuts,
+            return_audio=self.args.return_audio,
         )
 
         if self.args.bucketing_sampler:
@@ -224,6 +233,7 @@ class TtsDataModule:
             if self.args.on_the_fly_feats
             else PrecomputedFeatures(),
             return_cuts=self.args.return_cuts,
+            return_audio=self.args.return_audio,
         )
         dev_sampler = DynamicBucketingSampler(
             cuts_valid,
@@ -235,8 +245,15 @@ class TtsDataModule:
             validate,
             sampler=dev_sampler,
             batch_size=None,
-            num_workers=2,
-            persistent_workers=False,
+            # In-process. Validation runs every --valid-interval steps and this
+            # loader is not persistent, so any worker count above zero re-spawns
+            # processes on that cadence -- on Windows each spawn re-imports
+            # torch, and one of those imports failed 2000 steps into a run with
+            # ``OSError: [WinError 1114] ... Error loading ... torch\lib\shm.dll``,
+            # taking the training job down with it. The dev set is small enough
+            # that loading it on the main process costs seconds per validation,
+            # which is cheaper than the restart it replaces.
+            num_workers=0,
         )
 
         return dev_dl

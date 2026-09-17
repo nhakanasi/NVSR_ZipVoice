@@ -24,7 +24,8 @@ import argparse
 import logging
 import os
 import warnings
-from typing import List
+from collections import OrderedDict
+from typing import Dict, List
 
 import numpy as np
 import torch
@@ -70,6 +71,14 @@ def get_parser() -> argparse.ArgumentParser:
         type=str,
         default="wav",
         help="Extension of the speech files. Default: wav",
+    )
+    parser.add_argument(
+        "--score-path",
+        type=str,
+        default=None,
+        help="""Optional TSV to write per-utterance scores to. Needed for paired
+        comparisons between conditions; the printed summary is the mean only.
+        """,
     )
     return parser
 
@@ -134,7 +143,9 @@ class SpeakerSimilarity:
 
         return embeddings
 
-    def score(self, wav_path: str, extension: str, test_list: str) -> float:
+    def score(
+        self, wav_path: str, extension: str, test_list: str
+    ) -> Dict[str, float]:
         """
         Computes the Speaker Similarity (SIM-o) score between reference and
             evaluated speech.
@@ -145,7 +156,8 @@ class SpeakerSimilarity:
                 to reference prompts.
 
         Returns:
-            float: Average similarity score between reference and evaluated embeddings.
+            Per-utterance similarity, keyed by the test list's wav name and in its
+            order. The caller takes the mean; see the note at the reduction below.
         """
         logging.info(f"Calculating Speaker Similarity (SIM-o) score for {wav_path}")
         # Read test pairs
@@ -161,10 +173,12 @@ class SpeakerSimilarity:
         # Parse test pairs
         prompt_wavs = []
         eval_wavs = []
+        wav_names = []
         for line in lines:
             if len(line) != 4:
                 raise ValueError(f"Invalid line: {line}")
             wav_name, prompt_text, prompt_wav, text = line
+            wav_names.append(wav_name)
             eval_wav_path = os.path.join(wav_path, f"{wav_name}.{extension}")
             # Validate file existence
             if not os.path.exists(prompt_wav):
@@ -185,16 +199,23 @@ class SpeakerSimilarity:
                 f" {len(eval_embeddings)} eval embeddings"
             )
 
-        # Calculate similarity scores
-        scores = []
-        for prompt_emb, eval_emb in zip(prompt_embeddings, eval_embeddings):
+        # Calculate similarity scores, keyed by utterance. The headline number
+        # is the mean over these, but a mean cannot say whether a gap between
+        # two arms exceeds the noise between two runs of the same system, and
+        # SIM-o is the metric this study's claims rest on -- so the per-
+        # utterance values are returned rather than collapsed here, and the
+        # caller reduces them. Same reason ``dnsmos.py`` keeps its own.
+        scores = OrderedDict()
+        for name, prompt_emb, eval_emb in zip(
+            wav_names, prompt_embeddings, eval_embeddings
+        ):
             # Compute cosine similarity
             similarity = torch.nn.functional.cosine_similarity(
                 prompt_emb, eval_emb, dim=-1
             )
-            scores.append(similarity.item())
+            scores[name] = similarity.item()
 
-        return float(np.mean(scores))
+        return scores
 
 
 if __name__ == "__main__":
@@ -223,7 +244,16 @@ if __name__ == "__main__":
         sv_model_path=sv_model_path, ssl_model_path=ssl_model_path
     )
     # Compute similarity score
-    score = sim_evaluator.score(args.wav_path, args.extension, args.test_list)
+    scores = sim_evaluator.score(args.wav_path, args.extension, args.test_list)
+
+    if args.score_path is not None:
+        with open(args.score_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write("wav_name\tsim\n")
+            for name, value in scores.items():
+                f.write(f"{name}\t{value:.6f}\n")
+        logging.info(f"Wrote {len(scores)} per-file scores to {args.score_path}")
+
+    score = float(np.mean(list(scores.values())))
     print("-" * 50)
     logging.info(f"SIM-o score: {score:.3f}")
     print("-" * 50)

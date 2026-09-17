@@ -58,6 +58,12 @@ def get_parser() -> argparse.ArgumentParser:
         default="wav",
         help="Extension of the speech files. Default: wav",
     )
+    parser.add_argument(
+        "--score-path",
+        type=str,
+        default=None,
+        help="Optional TSV to write the per-file scores to, as sim.py does.",
+    )
     return parser
 
 
@@ -112,7 +118,9 @@ class UTMOSScore:
 
         return scores
 
-    def score_dir(self, dir_path: str, extension: str) -> float:
+    def score_dir(
+        self, dir_path: str, extension: str, score_path: str = None
+    ) -> float:
         """
         Computes the average UTMOS score for all files in a directory.
 
@@ -136,6 +144,17 @@ class UTMOSScore:
 
         # Compute scores
         scores = self.score_files(wav_files)
+
+        # Per-file scores let two systems be compared utterance by utterance,
+        # which the mean cannot do: the same mean can come from a uniform
+        # shift or from a few very good and very bad files.
+        if score_path:
+            with open(score_path, "w", encoding="utf-8") as handle:
+                handle.write("wav_name\tutmos\n")
+                for wav_file, score in zip(wav_files, scores):
+                    name = os.path.splitext(os.path.basename(wav_file))[0]
+                    handle.write(f"{name}\t{score:.6f}\n")
+            logging.info(f"Wrote {len(scores)} per-file scores to {score_path}")
 
         return float(np.mean(scores))
 
@@ -168,7 +187,7 @@ if __name__ == "__main__":
     utmos_evaluator = UTMOSScore(model_path)
 
     # Compute UTMOS score
-    score = utmos_evaluator.score_dir(args.wav_path, args.extension)
+    score = utmos_evaluator.score_dir(args.wav_path, args.extension, args.score_path)
     print("-" * 50)
     logging.info(f"UTMOS score: {score:.2f}")
     print("-" * 50)

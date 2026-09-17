@@ -7,6 +7,7 @@ lhotse
 huggingface_hub
 safetensors
 tensorboard
+wandb
 vocos
 pydub
 

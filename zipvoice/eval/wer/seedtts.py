@@ -222,7 +222,10 @@ def main(test_list, wav_path, extension, model_path, decode_path, lang, device):
             input_features = processor(
                 wav, sampling_rate=16000, return_tensors="pt"
             ).input_features
-            input_features = input_features.to(device)
+            # from_pretrained now honours the checkpoint's own dtype, and
+            # whisper-large-v3 ships as fp16, so a float32 feature tensor no
+            # longer matches the weights.
+            input_features = input_features.to(device=device, dtype=model.dtype)
             forced_decoder_ids = processor.get_decoder_prompt_ids(
                 language="english", task="transcribe"
             )
