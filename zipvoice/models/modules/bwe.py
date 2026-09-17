@@ -174,6 +174,48 @@ def sample_cutoff(
     return cutoff
 
 
+def band_mask(
+    cutoff_hz: torch.Tensor,
+    centers: torch.Tensor,
+    n_mels: int,
+    transition_bins: Union[float, torch.Tensor] = 3.0,
+) -> torch.Tensor:
+    """
+    The raised-cosine mask that says how missing each mel bin is above a cutoff.
+
+    Args:
+        cutoff_hz: cutoff frequency per utterance, shape ``(B,)``.
+        centers: mel filter center frequencies, shape ``(F,)``.
+        n_mels: number of mel bins, ``F``.
+        transition_bins: width of the roll-off in mel bins, either a float or a
+            per-utterance tensor of shape ``(B, 1)``. :func:`band_limit`
+            randomizes it during training; inference passes the nominal width so
+            the mask the sampler projects with is deterministic.
+
+    Returns:
+        ``(B, 1, F)``, 1.0 for fully missing bins, 0.0 for fully observed ones
+        and a ramp in between.
+    """
+    device = cutoff_hz.device
+    b = cutoff_hz.numel()
+    if not torch.is_tensor(transition_bins):
+        transition_bins = torch.full(
+            (1, 1), float(transition_bins), device=device, dtype=centers.dtype
+        )
+    dtype = transition_bins.dtype
+
+    cutoff_bin = hz_to_mel_bin(cutoff_hz.to(dtype), centers).view(b, 1)  # (B, 1)
+    width = transition_bins.clamp(min=1e-3)
+
+    bins = torch.arange(n_mels, device=device, dtype=dtype).view(1, n_mels)
+    # 0 at and below the cutoff bin, 1 once ``width`` bins above it, raised
+    # cosine in between. The ramp starts *at* the cutoff rather than straddling
+    # it so that a cutoff at or above the top filter center leaves the mel
+    # untouched, which is what a full-band prompt has to reduce to.
+    ramp = ((bins - cutoff_bin) / width).clamp(0.0, 1.0)
+    return ((1.0 - torch.cos(math.pi * ramp)) / 2.0).unsqueeze(1)  # (B, 1, F)
+
+
 def band_limit(
     features: torch.Tensor,
     cutoff_hz: torch.Tensor,
@@ -213,20 +255,10 @@ def band_limit(
     b, _, n_mels = features.shape
     device, dtype = features.device, features.dtype
 
-    cutoff_bin = hz_to_mel_bin(cutoff_hz.to(dtype), centers).view(b, 1)  # (B, 1)
     width = transition_bins * (
         0.5 + torch.rand(b, 1, device=device, dtype=dtype)
     )  # (B, 1) in [0.5, 1.5] * transition_bins
-    width = width.clamp(min=1e-3)
-
-    bins = torch.arange(n_mels, device=device, dtype=dtype).view(1, n_mels)
-    # 0 at and below the cutoff bin, 1 once ``width`` bins above it, raised
-    # cosine in between. The ramp starts *at* the cutoff rather than straddling
-    # it so that a cutoff at or above the top filter center leaves the mel
-    # untouched, which is what a full-band prompt has to reduce to.
-    ramp = ((bins - cutoff_bin) / width).clamp(0.0, 1.0)
-    mask = (1.0 - torch.cos(math.pi * ramp)) / 2.0  # (B, F)
-    mask = mask.unsqueeze(1)  # (B, 1, F)
+    mask = band_mask(cutoff_hz, centers, n_mels, width)
 
     fill = torch.full((b, 1, 1), float(floor), device=device, dtype=dtype)
     if floor_jitter > 0:
