@@ -27,8 +27,16 @@ optimum rather than a failure to reach it.
 
 So the high band is generated here instead of predicted. :class:`HighBandBranch`
 carries its own flow-matching state and its own velocity field, and a sample
-from it is a draw from the conditional distribution rather than its centre.
-Nothing averages, so nothing needs a discriminator to un-average it.
+from it is a draw from the conditional distribution rather than its centre. The
+flow-matching term alone therefore has no reason to hedge.
+
+Training is in two stages. Stage 1 is that flow-matching MSE plus an optional
+L1 term on the endpoint estimate: the L1 says plainly where the endpoint should
+land and stabilises early training, at the cost of pulling the branch back
+towards the median it was built to avoid, so its weight is a dial and 0 is a
+supported setting. Stage 2 is an adversarial finetune, which is what takes the
+hedge back out; :meth:`ZipVoiceDual.forward` returns the assembled endpoint and
+the masks a discriminator needs so that stage costs no extra backbone pass.
 
 The two models are coupled, not cascaded. Training is joint in the only sense
 that matters -- the branch is trained against the frozen backbone it will run
@@ -54,7 +62,7 @@ rather than a ``where``, and the transition bins are shared between the two
 trajectories in proportion to how observed they are.
 """
 
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -402,15 +410,29 @@ class ZipVoiceDual(ZipVoice):
         t: Tensor,
         step: int = 0,
         total_steps: int = 0,
-    ) -> Tensor:
-        """Flow-matching loss for the branch, over the missing band only.
+    ) -> Dict[str, Tensor]:
+        """The branch's training terms, over the missing band only.
 
         The backbone is teacher-forced exactly as it is in stock training, so
         the two models share ``xt`` and the projection inference performs is a
         no-op here; there is nothing extra to run on the training side.
 
-        There is deliberately no reconstruction term. An L1 or L2 penalty on the
-        predicted mel is precisely the hedge this architecture exists to remove.
+        Two terms are returned and the caller weights them:
+
+        ``fm_loss``
+            The flow-matching MSE on velocity. On its own it asks the branch to
+            be a generative model of the missing band, which is the whole point
+            of the architecture: a sample from a velocity field does not
+            average, so it does not hedge.
+        ``recon_loss``
+            An L1 error on the endpoint estimate. This term is minimised by the
+            per-bin conditional median, which in log-mel sits 9-10 dB below the
+            energy of any real sample -- it is exactly the hedge the adapter arm
+            measured, and weighting it heavily will reproduce that result. It is
+            here because it is also the term that stabilises early training by
+            saying plainly where the endpoint should land, and because an
+            adversarial stage can then take the hedge back out. Weight it
+            accordingly, and 0 is a supported setting.
 
         Args:
             tokens: a list of list of token ids.
@@ -421,8 +443,12 @@ class ZipVoiceDual(ZipVoice):
             step, total_steps: position in training, for the cutoff curriculum.
 
         Returns:
-            The mean squared velocity error over the missing band and the frames
-            the model has to generate.
+            ``fm_loss`` and ``recon_loss``, and alongside them the tensors an
+            adversarial stage needs and would otherwise have to recompute:
+            ``x1_hat`` (the endpoint estimate, backbone below the cutoff and
+            branch above it, as inference assembles it), ``condition`` (the
+            band-limited prompt), ``cutoff_hz``, ``band_mask``, ``frame_mask``
+            (True where the model had to generate) and ``t``.
         """
         with torch.no_grad():
             text_condition, padding_mask = self.forward_text_train(
@@ -471,7 +497,11 @@ class ZipVoiceDual(ZipVoice):
                 padding_mask=padding_mask,
                 return_hidden=True,
             )
-            del vt  # the backbone's own velocity is not part of this loss
+            # The backbone's own endpoint estimate. It is not part of any loss,
+            # but it is the low band of the mel an adversarial stage has to
+            # judge: showing a discriminator the ground-truth low band instead
+            # would hand it a half-real sample to call fake.
+            x1_backbone = xt + (1.0 - t) * vt
 
         ut = features - noise
         u_hat = self.branch(
@@ -489,11 +519,26 @@ class ZipVoiceDual(ZipVoice):
         # Weight each bin by how missing it is: 1.0 above the cutoff, 0.0 below
         # it, and the ramp in between counts in proportion. Frames inside the
         # prompt or the padding count for nothing.
-        frame_weight = (speech_condition_mask & (~padding_mask)).to(features.dtype)
-        weight = mask * frame_weight.unsqueeze(-1)
-        total = weight.sum()
-        fm_loss = (weight * (u_hat - ut) ** 2).sum() / total.clamp(min=1.0)
-        return fm_loss
+        frame_mask = speech_condition_mask & (~padding_mask)
+        weight = mask * frame_mask.to(features.dtype).unsqueeze(-1)
+        total = weight.sum().clamp(min=1.0)
+        fm_loss = (weight * (u_hat - ut) ** 2).sum() / total
+
+        # The endpoint the branch's velocity points at, assembled the way
+        # inference assembles it: backbone below the cutoff, branch above it.
+        x1_hat = self._project(x1_backbone, xt + (1.0 - t) * u_hat, mask)
+        recon_loss = (weight * (x1_hat - features).abs()).sum() / total
+
+        return {
+            "fm_loss": fm_loss,
+            "recon_loss": recon_loss,
+            "x1_hat": x1_hat,
+            "condition": speech_condition,
+            "cutoff_hz": cutoff_hz,
+            "band_mask": mask,
+            "frame_mask": frame_mask,
+            "t": t,
+        }
 
     def sample(
         self,
