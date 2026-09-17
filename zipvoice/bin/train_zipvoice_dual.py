@@ -84,7 +84,6 @@ from zipvoice.tokenizer.tokenizer import (
     SimpleTokenizer,
 )
 from zipvoice.utils.checkpoint import (
-    load_checkpoint,
     remove_checkpoints,
     resume_checkpoint,
     save_checkpoint,
@@ -1248,9 +1247,14 @@ def run(rank, world_size, args):
     # missing: a renamed key would otherwise leave part of the backbone at its
     # random initialization, and a random backbone still produces a hidden
     # state and a trajectory for the branch to be fitted against.
-    missing, unexpected = load_checkpoint(
-        filename=params.checkpoint, model=model, strict=False
-    )
+    # Not load_checkpoint: it hands back the checkpoint's remaining fields, not
+    # the key report this needs, and it loads non-strictly without saying what
+    # it skipped.
+    state = torch.load(params.checkpoint, map_location="cpu", weights_only=False)
+    state = state["model"]
+    if next(iter(state)).startswith("module."):
+        state = {k[len("module.") :]: v for k, v in state.items()}
+    missing, unexpected = model.load_state_dict(state, strict=False)
     assert not unexpected, unexpected
     assert all(k.startswith("branch.") for k in missing), missing
 
