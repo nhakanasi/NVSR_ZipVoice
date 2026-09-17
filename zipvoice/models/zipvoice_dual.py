@@ -164,6 +164,31 @@ class HighBandBranch(nn.Module):
         )
         self.use_cross_attn = use_cross_attn
 
+    def encode_condition(
+        self,
+        speech_condition: Tensor,
+        mask: Tensor,
+        cutoff_hz: Tensor,
+        prompt_mask: Tensor,
+    ) -> Tensor:
+        """The three conditioning streams, concatenated, (B, T, C).
+
+        None of the inputs carries the flow-matching state or the timestep, so
+        for a given utterance this is one tensor for the whole solve rather than
+        one per solver step. It is not cheap -- the frequency encoder runs an
+        attention over the mel bins of every frame, B*T sequences of ``num_bins``
+        tokens -- so :meth:`~ZipVoiceDual.sample` computes it once and passes it
+        back in. Training calls it per batch, where there is one step anyway.
+        """
+        return torch.cat(
+            [
+                self.freq_encoder(speech_condition, mask),
+                self.speaker_encoder(speech_condition, prompt_mask),
+                self.rate_encoder(cutoff_hz, speech_condition.size(1)),
+            ],
+            dim=2,
+        )
+
     def forward(
         self,
         t: Tensor,
@@ -175,6 +200,7 @@ class HighBandBranch(nn.Module):
         prompt_mask: Tensor,
         memory: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
+        condition: Optional[Tensor] = None,
     ) -> Tensor:
         """Velocity for the branch's own state.
 
@@ -190,23 +216,19 @@ class HighBandBranch(nn.Module):
             memory: the backbone's hidden state at this timestep, (B, T, M).
                 Required unless the branch was built without cross-attention.
             padding_mask: True at padded frames, (B, T).
+            condition: the output of :meth:`encode_condition` for this
+                utterance, if it has already been computed. Recomputed here
+                when absent.
 
         Returns:
             The predicted velocity, (B, T, F). Only the bins the band mask calls
             missing are ever used.
         """
-        num_frames = xt.size(1)
-        x = torch.cat(
-            [
-                xt,
-                text_condition,
-                speech_condition,
-                self.freq_encoder(speech_condition, mask),
-                self.speaker_encoder(speech_condition, prompt_mask),
-                self.rate_encoder(cutoff_hz, num_frames),
-            ],
-            dim=2,
-        )
+        if condition is None:
+            condition = self.encode_condition(
+                speech_condition, mask, cutoff_hz, prompt_mask
+            )
+        x = torch.cat([xt, text_condition, speech_condition, condition], dim=2)
 
         assert t.dim() in (0, 3), t.shape
         while t.dim() > 1 and t.size(-1) == 1:
@@ -625,6 +647,16 @@ class ZipVoiceDual(ZipVoice):
         )
         prompt_mask = (~speech_condition_mask) & (~padding_mask)
 
+        # Conditioning depends on the prompt and the cutoff, neither of which
+        # moves along the trajectory, so it is computed once for all num_step
+        # steps rather than rebuilt inside the loop.
+        condition = self.branch.encode_condition(
+            speech_condition=speech_condition,
+            mask=mask,
+            cutoff_hz=cutoff_hz,
+            prompt_mask=prompt_mask,
+        )
+
         for step in range(num_step):
             t = timesteps[step]
             dt = timesteps[step + 1] - timesteps[step]
@@ -647,6 +679,7 @@ class ZipVoiceDual(ZipVoice):
                 prompt_mask=prompt_mask,
                 memory=hidden,
                 padding_mask=padding_mask,
+                condition=condition,
             )
 
             x = x + v * dt  # the stock trajectory, which never reads the branch
