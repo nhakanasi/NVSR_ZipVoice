@@ -27,6 +27,7 @@ from typing import Optional, Tuple, Union
 import torch
 from torch import Tensor, nn
 
+from zipvoice.models.modules.cross_attention import CrossAttention
 from zipvoice.models.modules.scaling import (
     ActivationDropoutAndLinear,
     Balancer,
@@ -127,6 +128,7 @@ class TTSZipformer(nn.Module):
         use_guidance_scale_embed: bool = False,
         guidance_scale_embed_dim: int = 192,
         use_conv: bool = True,
+        cross_attn_dim: Optional[int] = None,
     ) -> None:
         super(TTSZipformer, self).__init__()
 
@@ -195,6 +197,7 @@ class TTSZipformer(nn.Module):
                 use_conv=use_conv,
                 cnn_module_kernel=cnn_module_kernel[i],
                 dropout=dropout,
+                cross_attn_dim=cross_attn_dim,
             )
 
             # For the segment of the warmup period, we let the Conv2dSubsampling
@@ -219,6 +222,10 @@ class TTSZipformer(nn.Module):
 
             encoders.append(encoder)
 
+        assert cross_attn_dim is None or all(f == 1 for f in downsampling_factor), (
+            "cross-attention needs the memory and the state on one frame grid",
+            downsampling_factor,
+        )
         self.encoders = nn.ModuleList(encoders)
         if self.use_time_embed:
             self.time_embed = nn.Sequential(
@@ -246,6 +253,7 @@ class TTSZipformer(nn.Module):
         padding_mask: Optional[Tensor] = None,
         guidance_scale: Optional[Tensor] = None,
         return_hidden: bool = False,
+        memory: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor]:
         """
         Args:
@@ -264,6 +272,12 @@ class TTSZipformer(nn.Module):
             encoder stack has downsampling factor 1, so that state is aligned
             frame for frame with the input and can be attended to directly by a
             model running on the same grid.
+          memory:
+            The external sequence to cross-attend to, of shape (batch_size,
+            seq_len, cross_attn_dim), required when the model was built with
+            ``cross_attn_dim``. It is passed to every stack unchanged, so a
+            model that takes a memory must have every downsampling factor equal
+            to 1; the constructor asserts that.
         Returns:
           Return the output embeddings. its shape is
             (batch_size, output_seq_len, encoder_dim)
@@ -294,6 +308,7 @@ class TTSZipformer(nn.Module):
                 time_emb=time_emb,
                 src_key_padding_mask=padding_mask,
                 attn_mask=attn_mask,
+                memory=memory,
             )
         hidden = x
         x = self.out_proj(x)
@@ -353,9 +368,18 @@ class Zipformer2EncoderLayer(nn.Module):
         bypass_skip_rate: FloatLike = ScheduledFloat(
             (0.0, 0.5), (4000.0, 0.02), default=0
         ),
+        cross_attn_dim: Optional[int] = None,
     ) -> None:
         super(Zipformer2EncoderLayer, self).__init__()
         self.embed_dim = embed_dim
+
+        # Attention to an external memory, e.g. a frozen model's hidden state
+        # running alongside this one. None -- the default -- is the stock layer.
+        self.cross_attn = (
+            None
+            if cross_attn_dim is None
+            else CrossAttention(embed_dim, cross_attn_dim, num_heads)
+        )
 
         # self.bypass implements layer skipping as well as bypass.
         self.bypass = BypassModule(
@@ -503,6 +527,7 @@ class Zipformer2EncoderLayer(nn.Module):
         time_emb: Optional[Tensor] = None,
         attn_mask: Optional[Tensor] = None,
         src_key_padding_mask: Optional[Tensor] = None,
+        memory: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Pass the input through the encoder layer.
@@ -518,6 +543,9 @@ class Zipformer2EncoderLayer(nn.Module):
             or (tgt_seq_len, src_seq_len). True means masked position. May be None.
           src_key_padding_mask:  the mask for padding, of shape (batch_size, seq_len);
             True means masked position.  May be None.
+          memory: the external sequence to cross-attend to, of shape
+            (batch_size, seq_len, cross_attn_dim). Required when the layer was
+            built with ``cross_attn_dim`` and ignored otherwise.
 
         Returns:
            A tensor which has the same shape as src
@@ -578,6 +606,12 @@ class Zipformer2EncoderLayer(nn.Module):
             if self_attn_dropout_mask is None
             else self_attn * self_attn_dropout_mask
         )
+
+        if self.cross_attn is not None:
+            assert memory is not None, "layer has cross-attention but got no memory"
+            src = src + self.cross_attn(
+                src, memory, key_padding_mask=src_key_padding_mask
+            )
 
         if self.use_conv:
             if torch.jit.is_scripting() or torch.jit.is_tracing():
@@ -715,6 +749,7 @@ class Zipformer2Encoder(nn.Module):
         time_emb: Optional[Tensor] = None,
         attn_mask: Optional[Tensor] = None,
         src_key_padding_mask: Optional[Tensor] = None,
+        memory: Optional[Tensor] = None,
     ) -> Tensor:
         r"""Pass the input through the encoder layers in turn.
 
@@ -730,6 +765,8 @@ class Zipformer2Encoder(nn.Module):
                 True means masked position. May be None.
             src_key_padding_mask:  the mask for padding, of shape (batch_size, seq_len);
                 True means masked position.  May be None.
+            memory: the external sequence every layer cross-attends to, of shape
+                (batch_size, seq_len, cross_attn_dim). May be None.
 
         Returns: a Tensor with the same shape as src.
         """
@@ -749,6 +786,7 @@ class Zipformer2Encoder(nn.Module):
                 time_emb=time_emb,
                 attn_mask=attn_mask,
                 src_key_padding_mask=src_key_padding_mask,
+                memory=memory,
             )
 
         return output
@@ -836,6 +874,7 @@ class DownsampledZipformer2Encoder(nn.Module):
         time_emb: Optional[Tensor] = None,
         attn_mask: Optional[Tensor] = None,
         src_key_padding_mask: Optional[Tensor] = None,
+        memory: Optional[Tensor] = None,
     ) -> Tensor:
         r"""Downsample, go through encoder, upsample.
 
@@ -857,6 +896,11 @@ class DownsampledZipformer2Encoder(nn.Module):
 
         Returns: a Tensor with the same shape as src.
         """
+        # Cross-attention keys would have to be pooled to this stack's frame
+        # rate to stay aligned. Nothing needs that yet -- a model that takes a
+        # memory runs every stack at factor 1 -- so refuse rather than guess at
+        # a pooling rule.
+        assert memory is None, "cross-attention is not supported in a downsampled stack"
         src_orig = src
         src = self.downsample(src)
         ds = self.downsample_factor
