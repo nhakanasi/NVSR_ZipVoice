@@ -193,3 +193,10 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+# Listening demos and evaluation figures. Generated from checkpoints and the
+# eval set, large, and regenerable, so they stay out of history.
+demo/
+egs/*/demo/
+# Figures are written to the repo root by one-off analysis scripts; anchored so
+# an image committed on purpose under a subdirectory still works.
+/*.png
