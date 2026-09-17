@@ -78,6 +78,7 @@ from vocos import Vocos
 
 from zipvoice.models.zipvoice import ZipVoice
 from zipvoice.models.zipvoice_distill import ZipVoiceDistill
+from zipvoice.models.zipvoice_dual import ZipVoiceDual
 from zipvoice.tokenizer.tokenizer import (
     EmiliaTokenizer,
     EspeakTokenizer,
@@ -114,8 +115,12 @@ def get_parser():
         "--model-name",
         type=str,
         default="zipvoice",
-        choices=["zipvoice", "zipvoice_distill"],
-        help="The model used for inference",
+        choices=["zipvoice", "zipvoice_distill", "zipvoice_dual"],
+        help="The model used for inference. zipvoice_dual is a locally "
+        "trained model: a frozen ZipVoice backbone plus a second flow-matching "
+        "branch that writes only the mel bins a band-limited prompt does not "
+        "observe, so it accepts a prompt recorded at any sampling rate. It has "
+        "no pre-trained release and requires --model-dir.",
     )
 
     parser.add_argument(
@@ -365,7 +370,9 @@ def generate_sentence_raw_evaluation(
     """
 
     # Load and process prompt wav
-    prompt_wav = load_prompt_wav(prompt_wav, sampling_rate=sampling_rate)
+    prompt_wav, prompt_sampling_rate = load_prompt_wav(
+        prompt_wav, sampling_rate=sampling_rate
+    )
     prompt_wav, prompt_rms = rms_norm(prompt_wav, target_rms)
 
     # Extract features from prompt wav
@@ -379,6 +386,18 @@ def generate_sentence_raw_evaluation(
     # Convert text to tokens
     tokens = tokenizer.texts_to_token_ids([text])
     prompt_tokens = tokenizer.texts_to_token_ids([prompt_text])
+
+    # A dual model needs to know where the prompt's own band ends: resampling
+    # to the model's rate does not recreate a band the recording never had, so
+    # the file's own rate is what says which mel bins are observed.
+    sample_kwargs = {}
+    if isinstance(model, ZipVoiceDual):
+        cutoff_hz = min(prompt_sampling_rate, sampling_rate) / 2
+        logging.info(
+            f"Conditioning on a prompt band-limited at {cutoff_hz:.0f} Hz "
+            f"(prompt recorded at {prompt_sampling_rate} Hz)"
+        )
+        sample_kwargs["cutoff_hz"] = cutoff_hz
 
     # Start timing
     start_t = dt.datetime.now()
@@ -399,6 +418,7 @@ def generate_sentence_raw_evaluation(
         duration="predict",
         num_step=num_step,
         guidance_scale=guidance_scale,
+        **sample_kwargs,
     )
 
     # Postprocess predicted features
@@ -494,7 +514,9 @@ def generate_sentence(
     """
 
     # Load and process prompt wav
-    prompt_wav = load_prompt_wav(prompt_wav, sampling_rate=sampling_rate)
+    prompt_wav, prompt_sampling_rate = load_prompt_wav(
+        prompt_wav, sampling_rate=sampling_rate
+    )
 
     # Remove edge and long silences in the prompt wav.
     # Add 0.2s trailing silence to avoid leaking prompt to generated speech.
@@ -552,6 +574,18 @@ def generate_sentence(
     chunked_features = []
     start_t = dt.datetime.now()
 
+    # A dual model needs to know where the prompt's own band ends: resampling
+    # to the model's rate does not recreate a band the recording never had, so
+    # the file's own rate is what says which mel bins are observed.
+    sample_kwargs = {}
+    if isinstance(model, ZipVoiceDual):
+        cutoff_hz = min(prompt_sampling_rate, sampling_rate) / 2
+        logging.info(
+            f"Conditioning on a prompt band-limited at {cutoff_hz:.0f} Hz "
+            f"(prompt recorded at {prompt_sampling_rate} Hz)"
+        )
+        sample_kwargs["cutoff_hz"] = cutoff_hz
+
     for batch_tokens in tokens_batches:
         batch_prompt_tokens = prompt_tokens * len(batch_tokens)
 
@@ -576,6 +610,7 @@ def generate_sentence(
             duration="predict",
             num_step=num_step,
             guidance_scale=guidance_scale,
+            **sample_kwargs,
         )
 
         # Postprocess predicted features
@@ -738,6 +773,11 @@ def main():
             "num_step": 8,
             "guidance_scale": 3.0,
         },
+        # The dual model's backbone is the stock one, solved on the stock grid.
+        "zipvoice_dual": {
+            "num_step": 16,
+            "guidance_scale": 1.0,
+        },
     }
 
     model_specific_defaults = model_defaults.get(params.model_name, {})
@@ -801,10 +841,20 @@ def main():
             **model_config["model"],
             **tokenizer_config,
         )
-    else:
-        assert params.model_name == "zipvoice_distill"
+    elif params.model_name == "zipvoice_distill":
         model = ZipVoiceDistill(
             **model_config["model"],
+            **tokenizer_config,
+        )
+    else:
+        assert params.model_name == "zipvoice_dual"
+        model = ZipVoiceDual(
+            **model_config["model"],
+            **model_config.get("dual", {}),
+            feat_scale=params.feat_scale,
+            # params.sampling_rate is only set further down, after the feature
+            # extractor is built; the band mask needs it here.
+            sampling_rate=model_config["feature"]["sampling_rate"],
             **tokenizer_config,
         )
 
