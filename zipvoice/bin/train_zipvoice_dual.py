@@ -19,17 +19,15 @@
 """
 This script trains the high-band branch of a dual-diffusion ZipVoice.
 
-The backbone is a released ZipVoice checkpoint and is frozen: it is run once
-per batch, under no_grad and in eval mode, to produce the hidden state the
-branch cross-attends to. Only the branch and its conditioning encoders are
-optimized, so --checkpoint is required rather than optional.
+The backbone is a released ZipVoice checkpoint and is frozen: it is run under
+no_grad and in eval mode to produce the trajectory and hidden state the branch
+cross-attends to. Only the branch and its conditioning encoders are optimized,
+so --checkpoint is required rather than optional.
 
-The loss is the flow-matching MSE on velocity, weighted by how missing each
-mel bin is under a simulated band-limited prompt, plus --recon-loss-weight
-times an L1 term on the endpoint estimate. That L1 term stabilises early
-training but is minimized by the conditional median, so it defaults to 0 and
-the adversarial stage 2 is what removes any remaining hedge; see
-zipvoice.models.zipvoice_dual for why.
+The branch predicts the clean endpoint directly. Its masked endpoint MSE is
+evaluated partly on teacher-forced flow states and partly on detached rollout
+states produced by the same coupled solver used at inference. An optional L1
+term and adversarial stage can be added; see zipvoice.models.zipvoice_dual.
 
 Usage:
 
@@ -106,8 +104,14 @@ from zipvoice.utils.common import (
     str2bool,
     torch_autocast,
 )
+from zipvoice.utils.feature import VocosFbank
 from zipvoice.utils.hooks import register_inf_check_hooks
-from zipvoice.utils.lr_scheduler import Eden, FixedLRScheduler, LRScheduler
+from zipvoice.utils.lr_scheduler import (
+    CosineDecayLRScheduler,
+    Eden,
+    FixedLRScheduler,
+    LRScheduler,
+)
 from zipvoice.utils.optim import ScaledAdam
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, LRScheduler]
@@ -172,6 +176,17 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--resume-checkpoint",
+        type=str,
+        default=None,
+        help="""Resume a run from a mid-epoch `checkpoint-{batch}.pt`, which no
+        epoch number can name. Restores the branch, the optimizer, the
+        discriminators and `batch_idx_train`, so training continues from the
+        step the file records rather than from scratch.
+        """,
+    )
+
+    parser.add_argument(
         "--exp-dir",
         type=str,
         default="exp/zipvoice",
@@ -225,6 +240,24 @@ def get_parser():
         default=False,
         help="Whether to use the fine-tuning mode, will used a fixed learning rate "
         "schedule and skip the large dropout phase.",
+    )
+
+    parser.add_argument(
+        "--lr-decay-start",
+        type=int,
+        default=-1,
+        help="""Fine-tuning only: hold the learning rate until this batch
+        index, then decay it with a cosine to --lr-final-ratio of the base rate
+        by --num-iters. Checkpoints taken at a fixed rate are snapshots of a
+        run that is still moving; the decay lets it settle. A negative value
+        keeps the rate fixed for the whole run.""",
+    )
+
+    parser.add_argument(
+        "--lr-final-ratio",
+        type=float,
+        default=0.1,
+        help="Learning rate at --num-iters, relative to --base-lr, when decaying.",
     )
 
     parser.add_argument(
@@ -319,14 +352,123 @@ def get_parser():
     # training's --condition-drop-ratio has nothing to act on and is gone.
 
     parser.add_argument(
+        "--fm-space",
+        type=str,
+        default="endpoint",
+        choices=["endpoint", "velocity"],
+        help="""Where the branch's MSE is measured. "endpoint" compares the
+        predicted and clean endpoints, which is the velocity error weighted by
+        (1-t)^2 and so barely trains the late steps. "velocity" compares the
+        implied velocity (x1_hat - y)/(1-t) with the one that reaches the clean
+        endpoint, (x1 - y)/(1-t): uniform in t, as the backbone was trained.
+        Requires --t-max below 1.""",
+    )
+
+    parser.add_argument(
+        "--t-max",
+        type=float,
+        default=1.0,
+        help="""Training flow times are drawn uniformly from [0, t-max), and
+        validation's fixed grid is scaled to the same range. Below 1 it keeps
+        the velocity-space loss's 1/(1-t)^2 factor bounded without clamping
+        it, which would make the weighting non-uniform near t-max.""",
+    )
+
+    parser.add_argument(
         "--recon-loss-weight",
         type=float,
         default=0.0,
         help="""Weight of the L1 term on the endpoint estimate, added to the
-        flow-matching MSE. This term is minimized by the per-bin conditional
+        endpoint MSE. This term is minimized by the per-bin conditional
         median, which in log-mel sits 9-10 dB below the energy of a real
         sample, so a large weight reproduces the adapter arm's hedge; the
         adversarial stage is what removes it. 0 disables the term.""",
+    )
+
+    parser.add_argument(
+        "--band-loss-weight",
+        type=float,
+        default=0.0,
+        help="""Weight of the band-level term: per utterance and per sub-band
+        of the missing range, the L1 distance between the endpoint estimate's
+        and the target's band energy, both its mean over the generated frames
+        (level and tilt) and its standard deviation over them (how far it
+        follows the voice). These are near-deterministic given the utterance,
+        so unlike the per-bin terms their optimum is not a hedge below the
+        real level. 0 disables the term.""",
+    )
+
+    parser.add_argument(
+        "--band-t-min",
+        type=float,
+        default=0.5,
+        help="""Only utterances whose flow time is at least this enter the
+        band-level term. Below it the endpoint estimate is largely noise, and
+        its band statistics say nothing about the band.""",
+    )
+
+    parser.add_argument(
+        "--solve-loss-weight",
+        type=float,
+        default=0.0,
+        help="""Weight of the band level, spread and envelope terms on an
+        evaluation-matched solve: --solve-utts utterances per batch are solved
+        from pure noise as inference solves them (16 steps, t_shift 0.5, the
+        backbone under guidance 1.0), with gradients through the final branch
+        call, whose endpoint is the output's high band. 0 disables it.""",
+    )
+
+    parser.add_argument(
+        "--solve-utts",
+        type=int,
+        default=2,
+        help="Utterances per batch that get the evaluation-matched solve.",
+    )
+
+    parser.add_argument(
+        "--rollout-prob",
+        type=float,
+        default=0.5,
+        help="""Per-utterance probability of training at a detached state
+        generated by the branch and frozen backbone instead of at the exact
+        teacher-forced flow marginal. 0 disables rollout training.""",
+    )
+
+    parser.add_argument(
+        "--rollout-steps",
+        type=int,
+        default=2,
+        help="""Number of no-gradient Euler steps used to construct a rollout
+        state from pure noise at t=0 to the supervised time. More steps improve
+        fidelity but add two frozen-backbone forwards (velocity on the stock
+        state, memory on the branch's) and one branch forward each.""",
+    )
+
+    parser.add_argument(
+        "--rollout-start-step",
+        type=int,
+        default=0,
+        help="""Rollout is off before this step. A fresh branch's rollouts are
+        noise, and training on them teaches nothing.""",
+    )
+
+    parser.add_argument(
+        "--rollout-ramp-steps",
+        type=int,
+        default=0,
+        help="""After --rollout-start-step, --rollout-prob is reached linearly
+        over this many steps. 0 switches it on at once.""",
+    )
+
+    parser.add_argument(
+        "--resample-degrade",
+        type=str2bool,
+        default=False,
+        help="""Band-limit the prompt by resampling the waveform, as the
+        evaluation prompts are, instead of by flooring the mel. The mel floor
+        sits 9-13 log-units below a real 24k->8k->24k file above the cutoff,
+        so a branch conditioned on it meets a different prompt at evaluation.
+        Needs the waveform, so it turns --return-audio on.""",
     )
 
     # Stage 2. Off unless a start step is given, so stage 1 is exactly the
@@ -377,7 +519,22 @@ def get_parser():
         help="""Only utterances whose flow time is at least this are
         discriminated. Below it the endpoint estimate is largely noise, and a
         discriminator trained to call noise fake learns the noise level rather
-        than the band.""",
+        than the band. Only used with --gan-source endpoint.""",
+    )
+
+    parser.add_argument(
+        "--gan-source",
+        type=str,
+        default="endpoint",
+        choices=["endpoint", "solve"],
+        help="""What the discriminators judge as fake. "endpoint" is the
+        branch's one-shot endpoint estimate at the training state, above
+        --gan-t-min. "solve" is the evaluation-matched solve of the first
+        --solve-utts utterances, the mel inference produces, with the target's
+        low band put under it so the real and the fake differ only in the band
+        the branch generates. It shares the solve --solve-loss-weight pays for;
+        keep that weight above zero so the band level stays anchored while the
+        discriminators shape its texture.""",
     )
 
     parser.add_argument(
@@ -568,13 +725,34 @@ def gan_context(
     Only utterances far enough along the flow qualify, so the tensors are
     sliced rather than masked: a discriminator has no per-utterance weight, and
     feeding it near-noise endpoints at a weight of zero is not available.
+
+    With --gan-source solve the subset is the solved utterances instead, and
+    the fake is their solved high band over the target's own low band. The
+    solve's low band is the backbone's, which the branch cannot change; judging
+    it would spend the discriminators on a difference no gradient can close.
     """
-    keep = (terms["t"].flatten() >= params.gan_t_min).nonzero().flatten()
-    if keep.numel() == 0:
-        return None
     # The model reports which frames it had to generate as (B, T) bools; the
     # discriminators multiply a (B, T, F) mel by it.
     frame_mask = terms["frame_mask"].to(features.dtype).unsqueeze(-1)
+    if params.gan_source == "solve":
+        if "solved_x1" not in terms:
+            return None
+        k = terms["solved_x1"].size(0)
+        real = features[:k]
+        band_mask = terms["band_mask"][:k]
+        return {
+            "features": real,
+            "x1_hat": real + (terms["solved_x1"] - real) * band_mask,
+            "band_mask": band_mask,
+            "cutoff_hz": terms["cutoff_hz"][:k],
+            "frame_mask": frame_mask[:k],
+            "centers": centers,
+            "num_frames": num_frames,
+        }
+
+    keep =(terms["t"].flatten() >= params.gan_t_min).nonzero().flatten()
+    if keep.numel() == 0:
+        return None
     return {
         "features": features[keep],
         "x1_hat": terms["x1_hat"][keep],
@@ -584,6 +762,132 @@ def gan_context(
         "centers": centers,
         "num_frames": num_frames,
     }
+
+
+# Sub-band edges of the band-level term, in Hz. Each band only counts the bins
+# a given utterance is missing, so the bands below its cutoff drop out.
+BAND_EDGES_HZ = (2000.0, 3000.0, 4000.0, 6000.0, 8000.0, 10000.0, 12000.0)
+
+
+def band_level_loss(
+    params: AttributeDict,
+    terms: dict,
+    features: Tensor,
+    centers: Tensor,
+) -> Tensor:
+    """L1 between the endpoint estimate's and the target's per-band energy
+    statistics over the generated frames: the mean, which carries level and
+    spectral tilt, and the standard deviation, which carries how far the band
+    rises and falls with the voice.
+
+    A band's energy in one frame is the mask-weighted mean of its log-mel bins.
+    Pairs of (utterance, band) with no missing bin or no generated frame, and
+    utterances below --band-t-min, count for nothing.
+    """
+    keep = (terms["t"].view(-1) >= params.band_t_min).to(features.dtype)  # (B,)
+    frames = terms["frame_mask"].to(features.dtype)  # (B, T)
+    num_frames = frames.sum(dim=1).clamp(min=1.0)  # (B,)
+    mask = terms["band_mask"].squeeze(1).to(features.dtype)  # (B, F)
+    # Statistics in float32: fp16 variance over long utterances is too coarse.
+    pred = terms["x1_hat"].float()
+    target = features.float()
+
+    edges = torch.tensor(BAND_EDGES_HZ, device=centers.device, dtype=centers.dtype)
+    loss = features.new_zeros((), dtype=torch.float32)
+    count = features.new_zeros((), dtype=torch.float32)
+    for low, high in zip(edges[:-1], edges[1:]):
+        in_band = ((centers >= low) & (centers < high)).to(mask.dtype)  # (F,)
+        weight = (mask * in_band).float()  # (B, F)
+        weight_sum = weight.sum(dim=1)  # (B,)
+        valid = keep * (weight_sum > 0).to(keep.dtype) * (frames.sum(dim=1) > 0)
+        if valid.sum() == 0:
+            continue
+        norm = weight_sum.clamp(min=1e-6).unsqueeze(1)  # (B, 1)
+        stats = []
+        for mel in (pred, target):
+            energy = (mel * weight.unsqueeze(1)).sum(dim=-1) / norm  # (B, T)
+            mean = (energy * frames).sum(dim=1) / num_frames
+            var = (((energy - mean.unsqueeze(1)) ** 2) * frames).sum(
+                dim=1
+            ) / num_frames
+            stats.append((mean, (var + 1e-6).sqrt()))
+        (pred_mean, pred_std), (target_mean, target_std) = stats
+        per_utt = (pred_mean - target_mean).abs() + (pred_std - target_std).abs()
+        loss = loss + (per_utt * valid).sum()
+        count = count + valid.sum()
+    return loss / count.clamp(min=1.0)
+
+
+def band_envelope_loss(
+    terms: dict,
+    features: Tensor,
+    centers: Tensor,
+    kernel: int = 5,
+) -> Tensor:
+    """L1 between the predicted and target per-band energy traces over time,
+    each smoothed over ``kernel`` frames, on the generated frames.
+
+    The band-level term only constrains each band's mean and spread over the
+    utterance, which a constant layer of noise or a horizontal ridge can meet.
+    This one asks the band to rise and fall where the target's does. The traces
+    are smoothed because the band's frame-to-frame detail is not predictable
+    from the low band, and an L1 on it would regress to the quiet median again.
+    """
+    frames = terms["frame_mask"].float()  # (B, T)
+    mask = terms["band_mask"].squeeze(1).float()  # (B, F)
+    pred = terms["x1_hat"].float()
+    target = features.float()
+
+    edges = torch.tensor(BAND_EDGES_HZ, device=centers.device, dtype=centers.dtype)
+    loss = pred.new_zeros(())
+    count = pred.new_zeros(())
+    for low, high in zip(edges[:-1], edges[1:]):
+        in_band = ((centers >= low) & (centers < high)).float()  # (F,)
+        weight = mask * in_band  # (B, F)
+        weight_sum = weight.sum(dim=1)  # (B,)
+        valid = (weight_sum > 0).float()
+        if valid.sum() == 0:
+            continue
+        norm = weight_sum.clamp(min=1e-6).unsqueeze(1)
+        traces = [
+            nn.functional.avg_pool1d(
+                ((mel * weight.unsqueeze(1)).sum(dim=-1) / norm).unsqueeze(1),
+                kernel_size=kernel,
+                stride=1,
+                padding=kernel // 2,
+                count_include_pad=False,
+            ).squeeze(1)
+            for mel in (pred, target)
+        ]  # (B, T) each
+        error = ((traces[0] - traces[1]).abs() * frames).sum(dim=1)
+        error = error / frames.sum(dim=1).clamp(min=1.0)
+        loss = loss + (error * valid).sum()
+        count = count + valid.sum()
+    return loss / count.clamp(min=1.0)
+
+
+def solve_output_loss(
+    params: AttributeDict,
+    terms: dict,
+    features: Tensor,
+    centers: Tensor,
+) -> Tensor:
+    """Band level, spread and envelope of the evaluation-matched solve.
+
+    ``terms["solved_x1"]`` is the mel inference would produce for the first few
+    utterances, so these terms judge what is scored rather than a one-shot
+    endpoint estimate from a training state.
+    """
+    k = terms["solved_x1"].size(0)
+    solved = {
+        "x1_hat": terms["solved_x1"],
+        "t": torch.ones(k, device=features.device),  # past any --band-t-min
+        "frame_mask": terms["frame_mask"][:k],
+        "band_mask": terms["band_mask"][:k],
+    }
+    return band_level_loss(
+        params, solved, features[:k], centers
+    ) + band_envelope_loss(solved, features[:k], centers)
 
 
 def compute_disc_loss(
@@ -625,6 +929,16 @@ def compute_disc_loss(
     return loss, info
 
 
+_FBANKS = {}
+
+
+def _resample_fbank(device: torch.device) -> nn.Module:
+    """The feature extractor's mel module, the one the features were made with."""
+    if device not in _FBANKS:
+        _FBANKS[device] = VocosFbank().fbank.to(device)
+    return _FBANKS[device]
+
+
 def compute_fbank_loss(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
@@ -633,6 +947,8 @@ def compute_fbank_loss(
     tokens: List[List[int]],
     is_training: bool,
     discriminators: Optional[Union[nn.Module, DDP]] = None,
+    audio: Optional[Tensor] = None,
+    audio_lens: Optional[Tensor] = None,
 ) -> Tuple[Tensor, MetricsTracker, Optional[dict]]:
     """
     Compute loss given the model and its inputs.
@@ -675,6 +991,30 @@ def compute_fbank_loss(
             .unsqueeze(1)
             .unsqueeze(2)
         )
+    t = t * params.t_max
+    rollout_prob = 0.0
+    if is_training and params.batch_idx_train >= params.rollout_start_step:
+        ramp = params.batch_idx_train - params.rollout_start_step + 1
+        rollout_prob = params.rollout_prob * min(
+            1.0, ramp / max(params.rollout_ramp_steps, 1)
+        )
+
+    fbank = None
+    if audio is not None:
+        fbank = _resample_fbank(device)
+        audio = audio.to(device)
+        audio_lens = audio_lens.to(device)
+
+    # One solve serves both consumers. Validation never solves: a 16-step
+    # solve on every dev batch costs more than the validation itself, so with
+    # --gan-source solve the validation log carries no adversarial terms.
+    gan_on_solve = (
+        discriminators is not None
+        and gan_enabled(params)
+        and params.gan_source == "solve"
+    )
+    want_solve = is_training and (params.solve_loss_weight > 0 or gan_on_solve)
+
     with torch.set_grad_enabled(is_training):
 
         terms = model(
@@ -685,13 +1025,33 @@ def compute_fbank_loss(
             t=t,
             step=params.batch_idx_train,
             total_steps=params.cutoff_curriculum_steps,
+            rollout_prob=rollout_prob,
+            rollout_steps=params.rollout_steps,
+            audio=audio,
+            audio_lens=audio_lens,
+            fbank=fbank,
+            solve_utts=params.solve_utts if want_solve else 0,
+            fm_space=params.fm_space,
         )
         fm_loss = terms["fm_loss"]
         recon_loss = terms["recon_loss"]
         loss = fm_loss + params.recon_loss_weight * recon_loss
 
+        inner = model.module if isinstance(model, DDP) else model
+        band_loss = None
+        if params.band_loss_weight > 0:
+            band_loss = band_level_loss(
+                params, terms, features, inner.mel_centers
+            )
+            loss = loss + params.band_loss_weight * band_loss
+        solve_loss = None
+        if "solved_x1" in terms and params.solve_loss_weight > 0:
+            solve_loss = solve_output_loss(
+                params, terms, features, inner.mel_centers
+            )
+            loss = loss + params.solve_loss_weight * solve_loss
+
     num_frames = features_lens.sum().item()
-    inner = model.module if isinstance(model, DDP) else model
     ctx = None
     adv_terms = {}
     # Validation runs this too, under no-grad: the adversarial and
@@ -759,6 +1119,13 @@ def compute_fbank_loss(
     info["loss"] = loss.detach().cpu().item() * num_frames
     info["fm_loss"] = fm_loss.detach().cpu().item() * num_frames
     info["recon_loss"] = recon_loss.detach().cpu().item() * num_frames
+    if band_loss is not None:
+        info["band_loss"] = band_loss.detach().cpu().item() * num_frames
+    if solve_loss is not None:
+        info["solve_loss"] = solve_loss.detach().cpu().item() * num_frames
+    info["rollout_fraction"] = (
+        terms["rollout_fraction"].detach().cpu().item() * num_frames
+    )
     for key, value in adv_terms.items():
         info[key] = value * num_frames
 
@@ -891,6 +1258,8 @@ def train_one_epoch(
                     features_lens=features_lens,
                     tokens=tokens,
                     is_training=True,
+                    audio=batch.get("audio"),
+                    audio_lens=batch.get("audio_lens"),
                     discriminators=discriminators,
                 )
                 if ctx is not None:
@@ -1063,6 +1432,8 @@ def compute_validation_loss(
             features_lens=features_lens,
             tokens=tokens,
             is_training=False,
+            audio=batch.get("audio"),
+            audio_lens=batch.get("audio_lens"),
             discriminators=discriminators,
         )
         assert loss.requires_grad is False
@@ -1141,6 +1512,8 @@ def scan_pessimistic_batches_for_oom(
                     features_lens=features_lens,
                     tokens=tokens,
                     is_training=True,
+                    audio=batch.get("audio"),
+                    audio_lens=batch.get("audio_lens"),
                 )
             loss.backward()
             optimizer.zero_grad()
@@ -1192,6 +1565,19 @@ def run(rank, world_size, args):
         model_config = json.load(f)
     params.update(model_config["model"])
     params.update(model_config["feature"])
+
+    if not 0.0 <= params.rollout_prob <= 1.0:
+        raise ValueError(
+            f"--rollout-prob must be in [0, 1], got {params.rollout_prob}"
+        )
+    if params.rollout_steps < 1:
+        raise ValueError(
+            f"--rollout-steps must be positive, got {params.rollout_steps}"
+        )
+    if not 0.0 < params.t_max <= 1.0:
+        raise ValueError(f"--t-max must be in (0, 1], got {params.t_max}")
+    if params.fm_space == "velocity" and params.t_max >= 1.0:
+        raise ValueError("--fm-space velocity needs --t-max below 1")
 
     fix_random_seed(params.seed)
     if world_size > 1:
@@ -1272,7 +1658,16 @@ def run(rank, world_size, args):
         model_avg = copy.deepcopy(model).to(torch.float64)
 
     assert params.start_epoch > 0, params.start_epoch
-    if params.start_epoch > 1:
+    checkpoints = None
+    if params.resume_checkpoint is not None:
+        logging.info(f"Resuming from {params.resume_checkpoint}")
+        checkpoints = resume_checkpoint(
+            params=params,
+            model=model,
+            model_avg=model_avg,
+            filename=params.resume_checkpoint,
+        )
+    elif params.start_epoch > 1:
         checkpoints = resume_checkpoint(params=params, model=model, model_avg=model_avg)
 
     model = model.to(params.device)
@@ -1319,7 +1714,14 @@ def run(rank, world_size, args):
 
     assert params.lr_hours >= 0
 
-    if params.finetune:
+    if params.finetune and params.lr_decay_start >= 0:
+        scheduler = CosineDecayLRScheduler(
+            optimizer,
+            decay_start=params.lr_decay_start,
+            decay_steps=params.num_iters - params.lr_decay_start,
+            final_ratio=params.lr_final_ratio,
+        )
+    elif params.finetune:
         scheduler = FixedLRScheduler(optimizer)
     elif params.lr_hours > 0:
         scheduler = Eden(optimizer, params.lr_batches, params.lr_hours)
@@ -1328,7 +1730,9 @@ def run(rank, world_size, args):
 
     scaler = create_grad_scaler(enabled=params.use_fp16)
 
-    if params.start_epoch > 1 and checkpoints is not None:
+    if checkpoints is not None and (
+        params.start_epoch > 1 or params.resume_checkpoint is not None
+    ):
         # load state_dict for optimizers
         if "optimizer" in checkpoints:
             logging.info("Loading optimizer state dict")
@@ -1494,6 +1898,11 @@ def main():
     TtsDataModule.add_arguments(parser)
     args = parser.parse_args()
     args.exp_dir = Path(args.exp_dir)
+    if args.resample_degrade:
+        # Forced rather than asserted: the two flags are one decision, and a
+        # run that silently fell back to the mel floor would look like a
+        # resampling run in the log.
+        args.return_audio = True
 
     world_size = args.world_size
     assert world_size >= 1

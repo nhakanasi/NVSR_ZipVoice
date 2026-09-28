@@ -30,13 +30,41 @@ carries its own flow-matching state and its own velocity field, and a sample
 from it is a draw from the conditional distribution rather than its centre. The
 flow-matching term alone therefore has no reason to hedge.
 
-Training is in two stages. Stage 1 is that flow-matching MSE plus an optional
-L1 term on the endpoint estimate: the L1 says plainly where the endpoint should
-land and stabilises early training, at the cost of pulling the branch back
-towards the median it was built to avoid, so its weight is a dial and 0 is a
-supported setting. Stage 2 is an adversarial finetune, which is what takes the
-hedge back out; :meth:`ZipVoiceDual.forward` returns the assembled endpoint and
-the masks a discriminator needs so that stage costs no extra backbone pass.
+The branch predicts the endpoint ``x1`` rather than the velocity, and the
+velocity the solver needs is derived from it as ``(x1_hat - xt) / (1 - t)``.
+The two are the same model up to a reparameterisation, and it does not make the
+``1 / (1 - t)`` factor in the solver go away. What it buys is that the network's
+own output is in mel units and anchored to the data manifold at every ``t``,
+that the loss is then in those units rather than weighted by ``1 / (1 - t)**2``
+towards the end of the trajectory, that an off-trajectory state needs no target
+recomputation -- the target is ``x1`` wherever the state is -- and that the
+endpoint a discriminator judges is the branch's own output, not the branch's
+output diluted by ``(1 - t)`` towards a state that already contains the answer.
+The cost turned out to be larger than all of that: a network that emits the
+endpoint has no identity path from its state. It never learned to carry the
+state's spectral shape through, so the band it produced was flat. The branch can
+therefore also emit a velocity instead (``branch_output_param="velocity"``).
+The endpoint is then ``y + (1 - t) * v``, and every consumer above still sees
+an endpoint.
+
+That last point is why the branch is also trained on states it generated itself.
+A field fitted only on the teacher-forced marginal ``xt = x1 * t + noise *
+(1 - t)`` is deployed on ``xt + delta``, where ``delta`` is what its own earlier
+steps got wrong, and the endpoint-consistent velocity there differs from the one
+it was taught by ``delta / (1 - t)`` -- 16x at ``t = 0.938``, the last step of a
+16-step solve. The backbone survives this because its conditional mean leans on
+the text and the prompt; the branch cannot, because above the cutoff it has
+nothing to lean on but the state. So on a fraction of batches the loss is taken
+at a state the branch rolled out itself, which is the only term that tells it
+how to recover from its own error.
+
+Training is in two stages. Stage 1 is that endpoint MSE plus an optional L1 term
+on the assembled endpoint: the L1 says plainly where the endpoint should land
+and stabilises early training, at the cost of pulling the branch back towards
+the median it was built to avoid, so its weight is a dial and 0 is a supported
+setting. Stage 2 is an adversarial finetune, which is what takes the hedge back
+out; :meth:`ZipVoiceDual.forward` returns the assembled endpoint and the masks a
+discriminator needs so that stage costs no extra backbone pass.
 
 The two models are coupled, not cascaded. Training is joint in the only sense
 that matters -- the branch is trained against the frozen backbone it will run
@@ -62,6 +90,7 @@ rather than a ``where``, and the transition bins are shared between the two
 trajectories in proportion to how observed they are.
 """
 
+from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -78,12 +107,31 @@ from zipvoice.models.modules.bwe import (
     band_limit,
     band_mask,
     mel_bin_centers,
+    resample_band_limit,
     sample_cutoff,
 )
 from zipvoice.models.modules.solver import get_time_steps
 from zipvoice.models.modules.zipformer import TTSZipformer
 from zipvoice.models.zipvoice import ZipVoice
 from zipvoice.utils.common import condition_time_mask, make_pad_mask
+
+
+def endpoint_to_velocity(
+    x1_hat: Tensor, xt: Tensor, t: Tensor, eps: float = 1e-3
+) -> Tensor:
+    """The flow-matching velocity an endpoint prediction implies.
+
+    ``xt + (1 - t) * u == x1_hat`` by construction, so this is the velocity that
+    walks straight at the predicted endpoint. On the training marginal it is the
+    ordinary conditional target, ``(x1 - xt) / (1 - t) == x1 - noise``; off it,
+    it is the velocity that still lands on ``x1_hat`` rather than the one the
+    teacher-forced state would have called for, which is the point.
+
+    ``eps`` bounds the ``1 / (1 - t)`` factor. The last step of a 16-step solve
+    sits at ``t = 0.9375``, a factor of 16; the clamp only ever bites on a
+    timestep far past that.
+    """
+    return (x1_hat - xt) / (1.0 - t).clamp(min=eps)
 
 
 class HighBandBranch(nn.Module):
@@ -125,8 +173,12 @@ class HighBandBranch(nn.Module):
         speaker_cond_dim: int = 128,
         rate_cond_dim: int = 64,
         use_cross_attn: bool = True,
+        output_param: str = "endpoint",
     ):
         super().__init__()
+        if output_param not in ("endpoint", "velocity"):
+            raise ValueError(f"unknown output_param {output_param!r}")
+        self.output_param = output_param
         self.feat_dim = feat_dim
 
         self.freq_encoder = FrequencyEncoder(
@@ -202,7 +254,7 @@ class HighBandBranch(nn.Module):
         padding_mask: Optional[Tensor] = None,
         condition: Optional[Tensor] = None,
     ) -> Tensor:
-        """Velocity for the branch's own state.
+        """The branch's endpoint estimate for its own state.
 
         Args:
             t: the current timestep, a scalar tensor or of shape (B, 1, 1).
@@ -221,8 +273,19 @@ class HighBandBranch(nn.Module):
                 when absent.
 
         Returns:
-            The predicted velocity, (B, T, F). Only the bins the band mask calls
-            missing are ever used.
+            The predicted endpoint ``x1_hat``, (B, T, F). Only the bins the band
+            mask calls missing are ever used. Pass it through
+            :func:`endpoint_to_velocity` for the velocity a solver wants.
+
+            With ``output_param="velocity"`` the network's output is a velocity
+            and the endpoint is ``xt + (1 - t) * v``, as the backbone's is. The
+            state then reaches the endpoint through an identity path, weighted
+            by ``t``. A network that emits the endpoint directly has to rebuild
+            the state's spectral detail from scratch. Measured on the endpoint
+            arm (every checkpoint from 3k to 28k, sr8000), its endpoint's
+            spectral detail was uncorrelated with a 95%-clean state's, against
+            0.78 for the backbone. Most of what it produced was one fixed
+            per-bin shape. The result is the flat upper band.
         """
         if condition is None:
             condition = self.encode_condition(
@@ -230,18 +293,22 @@ class HighBandBranch(nn.Module):
             )
         x = torch.cat([xt, text_condition, speech_condition, condition], dim=2)
 
+        t_state = t
         assert t.dim() in (0, 3), t.shape
         while t.dim() > 1 and t.size(-1) == 1:
             t = t.squeeze(-1)
         if t.dim() == 0:
             t = t.repeat(x.size(0))
 
-        return self.net(
+        out = self.net(
             x=x,
             t=t,
             padding_mask=padding_mask,
             memory=memory if self.use_cross_attn else None,
         )
+        if self.output_param == "velocity":
+            return xt + (1.0 - t_state) * out
+        return out
 
 
 class ZipVoiceDual(ZipVoice):
@@ -266,6 +333,7 @@ class ZipVoiceDual(ZipVoice):
         speaker_cond_dim: int = 128,
         rate_cond_dim: int = 64,
         use_cross_attn: bool = True,
+        branch_output_param: str = "endpoint",
         band_transition_bins: float = 3.0,
         band_floor_jitter: float = 0.1,
         band_noise_std: float = 0.0,
@@ -286,6 +354,11 @@ class ZipVoiceDual(ZipVoice):
             use_cross_attn: if False the branch is conditioned exactly as
                 before but blind to the backbone's hidden state. This is the
                 ablation that says what the fresh keys buy.
+            branch_output_param: "endpoint" (the network emits the endpoint)
+                or "velocity" (it emits a velocity, and the endpoint is
+                ``y + (1 - t) * v``). See :meth:`HighBandBranch.forward`. The
+                default keeps checkpoints trained before the option existed
+                loading and sampling as they were trained.
             band_*: the band-limiting simulation used during training.
             cutoff_min, cutoff_max, curriculum_*, full_band_prob: the cutoff
                 curriculum, see :func:`~zipvoice.models.modules.bwe.sample_cutoff`.
@@ -305,6 +378,7 @@ class ZipVoiceDual(ZipVoice):
             speaker_cond_dim=speaker_cond_dim,
             rate_cond_dim=rate_cond_dim,
             use_cross_attn=use_cross_attn,
+            output_param=branch_output_param,
         )
 
         self.register_buffer(
@@ -312,6 +386,7 @@ class ZipVoiceDual(ZipVoice):
             mel_bin_centers(n_mels=self.feat_dim, sampling_rate=sampling_rate),
             persistent=False,
         )
+        self.feat_scale = feat_scale
         self.mel_floor = LOG_MEL_FLOOR * feat_scale
         self.band_transition_bins = band_transition_bins
         self.band_floor_jitter = band_floor_jitter
@@ -364,6 +439,39 @@ class ZipVoiceDual(ZipVoice):
         model's" as a guarantee and as an approximation.
         """
         return x + (y - x) * mask
+
+    def _memory(
+        self,
+        t: Tensor,
+        y: Tensor,
+        text_condition: Tensor,
+        speech_condition: Tensor,
+        padding_mask: Tensor,
+    ) -> Tensor:
+        """The backbone's hidden state on the branch's own state ``y``.
+
+        The branch reads the backbone's hidden state as its memory, and that
+        state has to be computed on ``y``, not on the stock trajectory ``x``.
+        At teacher-forced training the two are one state, the flow marginal, so
+        the memory carries the band the branch is writing. At inference ``x``
+        never receives the branch's writes, so a memory computed on it carries
+        nothing above the cutoff: measured on the first dual run (21k, sr8000),
+        taking it from ``y`` instead raised 8-12 kHz by 14 dB with SIM-o
+        unchanged. The velocity still comes from ``x``, so the low band stays
+        the frozen model's.
+
+        Always the conditional pass: the hidden state ``_backbone_step`` hands
+        back under guidance is the conditional half's, which is this.
+        """
+        _, hidden = self.forward_fm_decoder(
+            t=t,
+            xt=y,
+            text_condition=text_condition,
+            speech_condition=speech_condition,
+            padding_mask=padding_mask,
+            return_hidden=True,
+        )
+        return hidden
 
     def _backbone_step(
         self,
@@ -432,20 +540,35 @@ class ZipVoiceDual(ZipVoice):
         t: Tensor,
         step: int = 0,
         total_steps: int = 0,
+        rollout_prob: float = 0.0,
+        rollout_steps: int = 1,
+        audio: Optional[Tensor] = None,
+        audio_lens: Optional[Tensor] = None,
+        fbank: Optional[nn.Module] = None,
+        solve_utts: int = 0,
+        solve_steps: int = 16,
+        solve_t_shift: float = 0.5,
+        solve_guidance_scale: float = 1.0,
+        fm_space: str = "endpoint",
     ) -> Dict[str, Tensor]:
         """The branch's training terms, over the missing band only.
 
-        The backbone is teacher-forced exactly as it is in stock training, so
-        the two models share ``xt`` and the projection inference performs is a
-        no-op here; there is nothing extra to run on the training side.
+        With probability ``rollout_prob`` per utterance, both trajectories are
+        advanced without gradients from shared pure noise at ``t=0`` to ``t``.
+        The supervised branch call then sees the resulting inference-like state
+        while retaining the exact clean endpoint target.
 
         Two terms are returned and the caller weights them:
 
         ``fm_loss``
-            The flow-matching MSE on velocity. On its own it asks the branch to
-            be a generative model of the missing band, which is the whole point
-            of the architecture: a sample from a velocity field does not
-            average, so it does not hedge.
+            The masked MSE between the predicted and clean endpoints, or with
+            ``fm_space="velocity"`` between the velocity the prediction implies
+            at the branch's state y, (x1_hat - y)/(1-t), and the one that
+            reaches the clean endpoint, (x1 - y)/(1-t). Their difference is the
+            endpoint error over (1-t), per utterance, so on teacher rows the
+            target is x1 - eps and on rollout rows the detached rollout state
+            takes the place of the interpolant. The name is retained for
+            checkpoint and metric compatibility.
         ``recon_loss``
             An L1 error on the endpoint estimate. This term is minimised by the
             per-bin conditional median, which in log-mel sits 9-10 dB below the
@@ -463,6 +586,21 @@ class ZipVoiceDual(ZipVoice):
             noise: the initial noise, (B, T, F).
             t: the timestep, (B, 1, 1).
             step, total_steps: position in training, for the cutoff curriculum.
+            rollout_prob: per-utterance probability of replacing the
+                teacher-forced state with a detached self-generated state.
+            rollout_steps: number of Euler steps from pure noise to ``t``. Must
+                be positive when rollout is enabled.
+            audio, audio_lens, fbank: when given, the prompt is band-limited by
+                really resampling the waveform and re-extracting the mel, which
+                is what the evaluation prompts went through, instead of by the
+                mel floor. The mask is then the deterministic one inference
+                projects with.
+            solve_utts: the first this many utterances are also solved from
+                pure noise exactly as inference solves them (``solve_steps``,
+                ``solve_t_shift``, the backbone under ``solve_guidance_scale``),
+                with gradients through the final branch call only. 0 skips it.
+            fm_space: "endpoint" or "velocity", where ``fm_loss`` is measured.
+                "velocity" needs every ``t`` below 1; the caller bounds it.
 
         Returns:
             ``fm_loss`` and ``recon_loss``, and alongside them the tensors an
@@ -470,8 +608,17 @@ class ZipVoiceDual(ZipVoice):
             ``x1_hat`` (the endpoint estimate, backbone below the cutoff and
             branch above it, as inference assembles it), ``condition`` (the
             band-limited prompt), ``cutoff_hz``, ``band_mask``, ``frame_mask``
-            (True where the model had to generate) and ``t``.
+            (True where the model had to generate), ``t``, and the realized
+            ``rollout_fraction``. With ``solve_utts``, also ``solved_x1``: the
+            evaluation-matched output of the first ``solve_utts`` utterances.
         """
+        if not 0.0 <= rollout_prob <= 1.0:
+            raise ValueError(f"rollout_prob must be in [0, 1], got {rollout_prob}")
+        if rollout_steps < 1:
+            raise ValueError(f"rollout_steps must be positive, got {rollout_steps}")
+        if fm_space not in ("endpoint", "velocity"):
+            raise ValueError(f"fm_space must be endpoint or velocity, got {fm_space}")
+
         with torch.no_grad():
             text_condition, padding_mask = self.forward_text_train(
                 tokens=tokens,
@@ -489,15 +636,28 @@ class ZipVoiceDual(ZipVoice):
                 full_band_prob=self.full_band_prob,
                 device=features.device,
             )
-            band_limited, mask = band_limit(
-                features=features,
-                cutoff_hz=cutoff_hz,
-                centers=self.mel_centers,
-                floor=self.mel_floor,
-                transition_bins=self.band_transition_bins,
-                floor_jitter=self.band_floor_jitter,
-                noise_std=self.band_noise_std,
-            )
+            if audio is not None:
+                band_limited = (
+                    resample_band_limit(
+                        audio=audio,
+                        audio_lens=audio_lens,
+                        cutoff_hz=cutoff_hz,
+                        fbank=fbank,
+                        num_frames=features.size(1),
+                    ).to(features.dtype)
+                    * self.feat_scale
+                )
+                mask = self._band_mask(cutoff_hz)
+            else:
+                band_limited, mask = band_limit(
+                    features=features,
+                    cutoff_hz=cutoff_hz,
+                    centers=self.mel_centers,
+                    floor=self.mel_floor,
+                    transition_bins=self.band_transition_bins,
+                    floor_jitter=self.band_floor_jitter,
+                    noise_std=self.band_noise_std,
+                )
 
             # True where the model has to generate, i.e. outside the prompt.
             speech_condition_mask = condition_time_mask(
@@ -509,11 +669,70 @@ class ZipVoiceDual(ZipVoice):
                 speech_condition_mask.unsqueeze(-1), 0, band_limited
             )
 
-            xt = features * t + noise * (1 - t)
+            teacher_xt = features * t + noise * (1 - t)
+            prompt_mask = (~speech_condition_mask) & (~padding_mask)
 
+            rollout_mask = torch.rand(
+                features.size(0), 1, 1, device=features.device
+            ) < rollout_prob
+            if rollout_mask.any():
+                # Begin exactly where inference does. Ground-truth high-band
+                # content is never inserted into a selected rollout input; it
+                # appears only as the endpoint supervision below.
+                t0 = torch.zeros_like(t)
+                dt = t / rollout_steps
+                x_roll = noise
+                y_roll = x_roll
+                rollout_condition = self.branch.encode_condition(
+                    speech_condition=speech_condition,
+                    mask=mask,
+                    cutoff_hz=cutoff_hz,
+                    prompt_mask=prompt_mask,
+                )
+                for rollout_step in range(rollout_steps):
+                    tr = dt * rollout_step
+                    vr = self.forward_fm_decoder(
+                        t=tr,
+                        xt=x_roll,
+                        text_condition=text_condition,
+                        speech_condition=speech_condition,
+                        padding_mask=padding_mask,
+                    )
+                    rollout_hidden = self._memory(
+                        t=tr,
+                        y=y_roll,
+                        text_condition=text_condition,
+                        speech_condition=speech_condition,
+                        padding_mask=padding_mask,
+                    )
+                    rollout_x1 = self.branch(
+                        t=tr,
+                        xt=y_roll,
+                        text_condition=text_condition,
+                        speech_condition=speech_condition,
+                        mask=mask,
+                        cutoff_hz=cutoff_hz,
+                        prompt_mask=prompt_mask,
+                        memory=rollout_hidden,
+                        padding_mask=padding_mask,
+                        condition=rollout_condition,
+                    )
+                    ur = endpoint_to_velocity(rollout_x1, y_roll, tr)
+                    x_roll = x_roll + vr * dt
+                    y_roll = self._project(x_roll, y_roll + ur * dt, mask)
+
+                backbone_xt = torch.where(rollout_mask, x_roll, teacher_xt)
+                branch_xt = torch.where(rollout_mask, y_roll, teacher_xt)
+            else:
+                backbone_xt = teacher_xt
+                branch_xt = teacher_xt
+
+            # Recompute the frozen backbone at the actual target-time state.
+            # Its hidden tensor now has the same state relationship to the
+            # branch input that it has inside sample().
             vt, hidden = self.forward_fm_decoder(
                 t=t,
-                xt=xt,
+                xt=backbone_xt,
                 text_condition=text_condition,
                 speech_condition=speech_condition,
                 padding_mask=padding_mask,
@@ -523,17 +742,27 @@ class ZipVoiceDual(ZipVoice):
             # but it is the low band of the mel an adversarial stage has to
             # judge: showing a discriminator the ground-truth low band instead
             # would hand it a half-real sample to call fake.
-            x1_backbone = xt + (1.0 - t) * vt
+            x1_backbone = backbone_xt + (1.0 - t) * vt
+            # On teacher rows the two states are one and the hidden state above
+            # is already the branch's. On rollout rows it was computed on the
+            # stock trajectory, which inference never hands the branch.
+            if rollout_mask.any():
+                hidden = self._memory(
+                    t=t,
+                    y=branch_xt,
+                    text_condition=text_condition,
+                    speech_condition=speech_condition,
+                    padding_mask=padding_mask,
+                )
 
-        ut = features - noise
-        u_hat = self.branch(
+        branch_x1 = self.branch(
             t=t,
-            xt=xt,
+            xt=branch_xt,
             text_condition=text_condition,
             speech_condition=speech_condition,
             mask=mask,
             cutoff_hz=cutoff_hz,
-            prompt_mask=(~speech_condition_mask) & (~padding_mask),
+            prompt_mask=prompt_mask,
             memory=hidden,
             padding_mask=padding_mask,
         )
@@ -544,14 +773,37 @@ class ZipVoiceDual(ZipVoice):
         frame_mask = speech_condition_mask & (~padding_mask)
         weight = mask * frame_mask.to(features.dtype).unsqueeze(-1)
         total = weight.sum().clamp(min=1.0)
-        fm_loss = (weight * (u_hat - ut) ** 2).sum() / total
+        err = branch_x1.float() - features.float()
+        if fm_space == "velocity":
+            # Per utterance, before the reduction; float32 because at t near
+            # t_max the factor is large.
+            err = err / (1.0 - t.float())
+        fm_loss = (weight * err**2).sum() / total
 
-        # The endpoint the branch's velocity points at, assembled the way
-        # inference assembles it: backbone below the cutoff, branch above it.
-        x1_hat = self._project(x1_backbone, xt + (1.0 - t) * u_hat, mask)
+        # Assemble the endpoint exactly as inference does: backbone below the
+        # cutoff and the branch's direct endpoint prediction above it.
+        x1_hat = self._project(x1_backbone, branch_x1, mask)
         recon_loss = (weight * (x1_hat - features).abs()).sum() / total
 
+        extra = {}
+        if solve_utts > 0:
+            k = min(solve_utts, features.size(0))
+            extra["solved_x1"] = self._solve(
+                noise=noise[:k],
+                text_condition=text_condition[:k],
+                speech_condition=speech_condition[:k],
+                padding_mask=padding_mask[:k],
+                mask=mask[:k],
+                cutoff_hz=cutoff_hz[:k],
+                prompt_mask=prompt_mask[:k],
+                num_step=solve_steps,
+                t_shift=solve_t_shift,
+                guidance_scale=solve_guidance_scale,
+                grad_last_step=True,
+            )
+
         return {
+            **extra,
             "fm_loss": fm_loss,
             "recon_loss": recon_loss,
             "x1_hat": x1_hat,
@@ -560,7 +812,97 @@ class ZipVoiceDual(ZipVoice):
             "band_mask": mask,
             "frame_mask": frame_mask,
             "t": t,
+            "rollout_fraction": rollout_mask.float().mean(),
         }
+
+    def _solve(
+        self,
+        noise: Tensor,
+        text_condition: Tensor,
+        speech_condition: Tensor,
+        padding_mask: Tensor,
+        mask: Tensor,
+        cutoff_hz: Tensor,
+        prompt_mask: Tensor,
+        num_step: int,
+        t_shift: float,
+        guidance_scale: float,
+        grad_last_step: bool = False,
+    ) -> Tensor:
+        """Solve both trajectories from ``noise`` and return the assembled mel.
+
+        This is the whole of inference once the conditioning is built, and
+        training calls it too so that an auxiliary loss can see exactly the mel
+        evaluation scores. With ``grad_last_step`` every step but the last runs
+        without gradients and the last branch call keeps them. The last Euler
+        step lands on t=1, where it equals that call's endpoint estimate, so the
+        high band of the returned mel *is* that call's output: the gradient is
+        exact at the output and truncated through the states that led to it.
+        """
+        timesteps = get_time_steps(
+            t_start=0.0,
+            t_end=1.0,
+            num_step=num_step,
+            t_shift=t_shift,
+            device=noise.device,
+        )
+        x = noise
+        y = x  # one noise, so the two trajectories start with the same low band
+
+        for step in range(num_step):
+            t = timesteps[step]
+            dt = timesteps[step + 1] - timesteps[step]
+            with_grad = grad_last_step and step == num_step - 1
+            no_grad = grad_last_step and not with_grad
+
+            with torch.set_grad_enabled(torch.is_grad_enabled() and not no_grad):
+                if step == 0 or with_grad:
+                    # Conditioning depends on the prompt and the cutoff, neither
+                    # of which moves along the trajectory, so it is computed
+                    # once rather than per step -- and once more for the step
+                    # that has to carry gradients into the encoder.
+                    condition = self.branch.encode_condition(
+                        speech_condition=speech_condition,
+                        mask=mask,
+                        cutoff_hz=cutoff_hz,
+                        prompt_mask=prompt_mask,
+                    )
+                with torch.no_grad() if grad_last_step else nullcontext():
+                    # The frozen backbone never needs gradients, but plain
+                    # inference leaves grad mode to its caller.
+                    v, _ = self._backbone_step(
+                        t=t,
+                        x=x,
+                        text_condition=text_condition,
+                        speech_condition=speech_condition,
+                        padding_mask=padding_mask,
+                        guidance_scale=guidance_scale,
+                    )
+                    hidden = self._memory(
+                        t=t,
+                        y=y,
+                        text_condition=text_condition,
+                        speech_condition=speech_condition,
+                        padding_mask=padding_mask,
+                    )
+                branch_x1 = self.branch(
+                    t=t,
+                    xt=y,
+                    text_condition=text_condition,
+                    speech_condition=speech_condition,
+                    mask=mask,
+                    cutoff_hz=cutoff_hz,
+                    prompt_mask=prompt_mask,
+                    memory=hidden,
+                    padding_mask=padding_mask,
+                    condition=condition,
+                )
+                u = endpoint_to_velocity(branch_x1, y, t)
+
+                x = x + v * dt  # the stock trajectory, which never reads the branch
+                y = self._project(x, y + u * dt, mask)
+
+        return self._project(x, y, mask)
 
     def sample(
         self,
@@ -633,59 +975,23 @@ class ZipVoiceDual(ZipVoice):
         cutoff_hz = cutoff_hz.to(device=device, dtype=prompt_features.dtype)
         mask = self._band_mask(cutoff_hz)
 
-        x = torch.randn(
+        noise = torch.randn(
             batch_size, num_frames, prompt_features.size(-1), device=device
-        )
-        y = x  # one noise, so the two trajectories start with the same low band
-
-        timesteps = get_time_steps(
-            t_start=0.0,
-            t_end=1.0,
-            num_step=num_step,
-            t_shift=t_shift,
-            device=device,
         )
         prompt_mask = (~speech_condition_mask) & (~padding_mask)
 
-        # Conditioning depends on the prompt and the cutoff, neither of which
-        # moves along the trajectory, so it is computed once for all num_step
-        # steps rather than rebuilt inside the loop.
-        condition = self.branch.encode_condition(
+        x1 = self._solve(
+            noise=noise,
+            text_condition=text_condition,
             speech_condition=speech_condition,
+            padding_mask=padding_mask,
             mask=mask,
             cutoff_hz=cutoff_hz,
             prompt_mask=prompt_mask,
+            num_step=num_step,
+            t_shift=t_shift,
+            guidance_scale=guidance_scale,
         )
-
-        for step in range(num_step):
-            t = timesteps[step]
-            dt = timesteps[step + 1] - timesteps[step]
-
-            v, hidden = self._backbone_step(
-                t=t,
-                x=x,
-                text_condition=text_condition,
-                speech_condition=speech_condition,
-                padding_mask=padding_mask,
-                guidance_scale=guidance_scale,
-            )
-            u = self.branch(
-                t=t,
-                xt=y,
-                text_condition=text_condition,
-                speech_condition=speech_condition,
-                mask=mask,
-                cutoff_hz=cutoff_hz,
-                prompt_mask=prompt_mask,
-                memory=hidden,
-                padding_mask=padding_mask,
-                condition=condition,
-            )
-
-            x = x + v * dt  # the stock trajectory, which never reads the branch
-            y = self._project(x, y + u * dt, mask)
-
-        x1 = self._project(x, y, mask)
 
         x1_wo_prompt_lens = (~padding_mask).sum(-1) - prompt_features_lens
         x1_prompt = torch.zeros(

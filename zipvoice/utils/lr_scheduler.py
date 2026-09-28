@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import logging
+import math
 from typing import List, Optional, Union
 
 import torch
@@ -202,6 +203,43 @@ class FixedLRScheduler(LRScheduler):
     def get_lr(self):
 
         return [x for x in self.base_lrs]
+
+
+class CosineDecayLRScheduler(LRScheduler):
+    """
+    Fixed learning rate until ``decay_start``, then a cosine decay to
+    ``final_ratio`` times the base rate over ``decay_steps`` batches, held there
+    afterwards. The position is the global batch index, so a resumed run picks
+    the schedule up where its step count says it is.
+
+    Args:
+        optimizer: the optimizer to change the learning rates on
+        decay_start: batch index at which the decay begins
+        decay_steps: number of batches the decay takes
+        final_ratio: learning rate at the end of the decay, relative to the base
+    """
+
+    def __init__(
+        self,
+        optimizer: Optimizer,
+        decay_start: int,
+        decay_steps: int,
+        final_ratio: float = 0.1,
+        verbose: bool = False,
+    ):
+        super(CosineDecayLRScheduler, self).__init__(optimizer, verbose)
+        self.decay_start = decay_start
+        self.decay_steps = max(decay_steps, 1)
+        self.final_ratio = final_ratio
+
+    def get_lr(self):
+        progress = min(
+            max(self.batch - self.decay_start, 0) / self.decay_steps, 1.0
+        )
+        factor = self.final_ratio + (1.0 - self.final_ratio) * 0.5 * (
+            1.0 + math.cos(math.pi * progress)
+        )
+        return [x * factor for x in self.base_lrs]
 
 
 def _test_eden():
