@@ -79,6 +79,11 @@ from huggingface_hub import hf_hub_download
 from lhotse.utils import fix_random_seed
 from vocos import Vocos
 
+from zipvoice.models.modules.bwe import (
+    LOG_MEL_FLOOR,
+    band_limit,
+    mel_bin_centers,
+)
 from zipvoice.models.zipvoice import ZipVoice
 from zipvoice.models.zipvoice_adapter import ZipVoiceAdapter, adapter_kwargs
 from zipvoice.models.zipvoice_bwe import ZipVoiceBWE
@@ -425,6 +430,23 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--prompt-floor",
+        type=str2bool,
+        default=False,
+        help="Push the prompt's above-cutoff bins down "
+        "to the mel floor before anything reads them, reproducing the "
+        "degradation a checkpoint trained without --resample-degrade was fitted "
+        "on. A really band-limited prompt sits about 8.7 log-units higher there "
+        "than that floor, so such a branch is otherwise asked at inference to "
+        "read a dead band some 40 dB hotter than the one it learned from. "
+        "Applies to any model: zipvoice_adapter does it inside ``sample``, "
+        "anything else through ``floor_prompt_band``, so the released model can "
+        "be run under the same conditioning as an attribution control. "
+        "Inference-only, and a diagnostic rather than a fix: it also throws "
+        "away whatever the real prompt does carry above the cutoff.",
+    )
+
+    parser.add_argument(
         "--band-fill",
         type=str2bool,
         default=False,
@@ -520,6 +542,54 @@ def extend_prompt_band(
         use_extender=model.bwe_bypass != "resunet",
     )
     return restored
+
+
+def floor_prompt_band(
+    model: torch.nn.Module,
+    prompt_features: torch.Tensor,
+    prompt_sampling_rate: int,
+    sampling_rate: int,
+    feat_scale: float,
+) -> torch.Tensor:
+    """
+    Put the prompt's dead band on the mel floor the band-limit transform uses.
+
+    This is the attribution control for ``--prompt-floor``: it applies the same
+    transform to a model that has no band machinery of its own, so the effect of
+    the conditioning change can be read separately from the effect of whatever
+    branch or adapted backbone is reading it.
+
+    ``ZipVoiceAdapter`` is excluded because it already does this inside
+    ``sample``, where it can keep the band mask it hands the branch consistent
+    with the prompt it floors; flooring here as well would apply it twice.
+
+    The transform is deterministic -- no floor jitter, no dead-band noise and a
+    fixed roll-off width -- so two runs on the same prompt agree.
+    """
+    if not getattr(model, "prompt_floor", False) or isinstance(model, ZipVoiceAdapter):
+        return prompt_features
+
+    cutoff_hz = min(prompt_sampling_rate, sampling_rate) / 2
+    logging.info(
+        f"Flooring the prompt mel above {cutoff_hz:.0f} Hz "
+        f"(prompt recorded at {prompt_sampling_rate} Hz)"
+    )
+    cutoff = torch.full(
+        (prompt_features.size(0),),
+        cutoff_hz,
+        device=prompt_features.device,
+        dtype=prompt_features.dtype,
+    )
+    floored, _ = band_limit(
+        prompt_features,
+        cutoff,
+        centers=mel_bin_centers(
+            n_mels=prompt_features.size(-1), sampling_rate=sampling_rate
+        ).to(prompt_features.device),
+        floor=LOG_MEL_FLOOR * feat_scale,
+        randomize_transition=False,
+    )
+    return floored
 
 
 def band_sample_kwargs(
@@ -638,6 +708,9 @@ def generate_sentence_raw_evaluation(
     prompt_features = prompt_features.unsqueeze(0) * feat_scale
     prompt_features = extend_prompt_band(
         model, prompt_features, prompt_sampling_rate, sampling_rate
+    )
+    prompt_features = floor_prompt_band(
+        model, prompt_features, prompt_sampling_rate, sampling_rate, feat_scale
     )
     prompt_features_lens = torch.tensor([prompt_features.size(1)], device=device)
 
@@ -801,6 +874,9 @@ def generate_sentence(
     prompt_features = prompt_features.unsqueeze(0) * feat_scale
     prompt_features = extend_prompt_band(
         model, prompt_features, prompt_sampling_rate, sampling_rate
+    )
+    prompt_features = floor_prompt_band(
+        model, prompt_features, prompt_sampling_rate, sampling_rate, feat_scale
     )
 
     # Add punctuation in the end if there is not
@@ -1153,6 +1229,8 @@ def main():
         model.decouple_residual = params.decouple_residual
         model.band_fill = params.band_fill
         model.project_low_band = params.project_low_band
+
+    model.prompt_floor = params.prompt_floor
 
     if str(model_ckpt).endswith(".safetensors"):
         safetensors.torch.load_model(model, model_ckpt)

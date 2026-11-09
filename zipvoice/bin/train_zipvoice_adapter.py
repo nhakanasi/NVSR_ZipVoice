@@ -60,6 +60,7 @@ python3 -m zipvoice.bin.train_zipvoice_adapter \
 """
 
 import argparse
+import contextlib
 import copy
 import json
 import logging
@@ -67,7 +68,7 @@ import os
 from functools import partial
 from pathlib import Path
 from shutil import copyfile
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.multiprocessing as mp
@@ -90,6 +91,7 @@ from zipvoice.models.modules.bwe_discriminators import (
 from zipvoice.models.modules.bwe import resample_band_limit, sample_cutoff
 from zipvoice.utils.feature import VocosFbank
 from zipvoice.models.modules.perceptual import SpeakerPerceptual
+from zipvoice.models.zipvoice import ZipVoice
 from zipvoice.models.zipvoice_adapter import ZipVoiceAdapter, adapter_kwargs
 from zipvoice.tokenizer.tokenizer import (
     EmiliaTokenizer,
@@ -324,7 +326,7 @@ def get_parser():
         default=5000,
         help="""Save checkpoint after processing this number of batches"
         periodically. We save checkpoint to exp-dir/ whenever
-        params.batch_idx_train % save_every_n == 0. The checkpoint filename
+        params.batch_idx_train %% save_every_n == 0. The checkpoint filename
         has the form: f'exp-dir/checkpoint-{params.batch_idx_train}.pt'
         Note: It also saves checkpoint to `exp-dir/epoch-xxx.pt` at the
         end of each epoch where `xxx` is the epoch number counting from 1.
@@ -461,12 +463,24 @@ def add_adapter_arguments(parser: argparse.ArgumentParser) -> None:
         "--adapter-trainable",
         type=str,
         default="adapter",
-        choices=["adapter", "decoder", "all"],
+        choices=["adapter", "shallow", "decoder", "all", "lora"],
         help="Which parameters the optimiser sees. 'adapter' trains only the "
         "branch and leaves every released tensor bit-identical, which is "
-        "stage 2a and the default. 'decoder' also releases the flow-matching "
-        "decoder, which is stage 2b. 'all' releases everything and exists to "
-        "measure what the restraint costs.",
+        "stage 2a and the default. 'shallow' also releases the decoder's 1-D "
+        "parameters and its two band-facing projections, about 0.4%% of it, so "
+        "the pretrained velocity field is adjusted rather than retrained. "
+        "'decoder' releases the whole flow-matching decoder, which is stage 2b. "
+        "'all' releases everything and exists to measure what the restraint "
+        "costs. 'lora' trains the branch and the decoder's LoRA factors, which "
+        "are gated off on a full-band prompt; needs --lora-rank.",
+    )
+    parser.add_argument(
+        "--lora-rank",
+        type=int,
+        default=None,
+        help="Rank of the low-rank update on the decoder's in/out projections, "
+        "applied only to utterances whose prompt is missing a band. 0 installs "
+        "none. Overrides the model config.",
     )
 
     parser.add_argument(
@@ -557,6 +571,15 @@ def add_adapter_arguments(parser: argparse.ArgumentParser) -> None:
         "out of the training target. Overrides the model config.",
     )
     parser.add_argument(
+        "--steer-all-bins",
+        type=str2bool,
+        default=None,
+        help="Let the branch's velocity write every mel bin instead of only "
+        "the ones the prompt is missing, so it can steer the low band its own "
+        "writes disturb. Still inert on a full-band prompt. Incompatible with "
+        "inference's --project-low-band. Overrides the model config.",
+    )
+    parser.add_argument(
         "--resample-degrade",
         type=str2bool,
         default=False,
@@ -567,6 +590,16 @@ def add_adapter_arguments(parser: argparse.ArgumentParser) -> None:
         "files, so this removes a train/test mismatch. Requires audio in the "
         "batch, which it switches on.",
     )
+    parser.add_argument(
+        "--degrade-variants",
+        type=str2bool,
+        default=False,
+        help="With --resample-degrade, vary the downsampler: half the batches' "
+        "rate groups use the evaluation pipeline's exact resampler, the rest a "
+        "different anti-alias filter, plus an optional early roll-off and a "
+        "small noise floor. For deployment on devices whose front end is "
+        "unknown.",
+    )
     # Charging the branch for what its writes do outside the band it writes.
     #
     # The residual is added to a velocity, so the solver carries it into the
@@ -574,6 +607,190 @@ def add_adapter_arguments(parser: argparse.ArgumentParser) -> None:
     # answers in every bin, including the ones the branch is masked out of.
     # That off-diagonal response is where the speaker similarity goes, and no
     # earlier arm had a gradient into it. See ``forward``'s drift block.
+    parser.add_argument("--multistep-loss-weight", type=float, default=0.0)
+    parser.add_argument("--multistep-steps", type=int, default=3)
+    parser.add_argument("--multistep-max-utts", type=int, default=1)
+
+    parser.add_argument(
+        "--identity-rollout-steps",
+        type=int,
+        default=0,
+        help="Number of solver steps in the identity rollout, which should be "
+        "the number inference uses. Zero switches the rollout off. On a rollout "
+        "batch the model runs the deployed solve on one utterance and the only "
+        "term charged is the speaker identity loss on that sample; the "
+        "flow-matching, reconstruction, band and envelope terms are not "
+        "computed at all, so they are neither trained nor logged on it.",
+    )
+    parser.add_argument(
+        "--identity-rollout-prob",
+        type=float,
+        default=0.0,
+        help="Fraction of training batches that are rollout batches. The rest "
+        "are ordinary flow-matching batches, unchanged.",
+    )
+    parser.add_argument(
+        "--identity-rollout-guidance",
+        type=float,
+        default=0.5,
+        help="Classifier-free guidance scale inside the rollout. Must match "
+        "inference: guidance is part of the generator, not a decoding "
+        "preference, and a rollout run at a different scale trains a model that "
+        "is never deployed.",
+    )
+    parser.add_argument(
+        "--identity-rollout-t-shift",
+        type=float,
+        default=0.5,
+        help="Timestep shift inside the rollout. Must match inference, for the "
+        "same reason as --identity-rollout-guidance.",
+    )
+    parser.add_argument(
+        "--identity-rollout-max-seconds",
+        type=float,
+        default=8.0,
+        help="Longest utterance a rollout may be run on. The rollout costs "
+        "--identity-rollout-steps decoder forwards at twice the batch, so its "
+        "cost is the utterance's length; this caps that, and the utterance is "
+        "then drawn uniformly from those that fit rather than always being the "
+        "shortest one, which would point identity supervision at the spans "
+        "carrying the least speaker evidence. Zero removes the cap.",
+    )
+    parser.add_argument(
+        "--identity-rollout-accumulate",
+        type=str2bool,
+        default=True,
+        help="Fold a rollout batch's gradient into the next ordinary batch's "
+        "update instead of stepping on it alone. This is not a convenience: "
+        "ScaledAdam substitutes zeros for a missing gradient and applies the "
+        "momentum step to every parameter it owns, so an identity-only update "
+        "would still move the backbone along its last flow-matching direction, "
+        "which is exactly the exclusion the rollout is built to keep. Setting "
+        "this False restores separate identity-only updates and that drift.",
+    )
+    parser.add_argument(
+        "--identity-rollout-weight",
+        type=float,
+        default=0.0,
+        help="Weight of the speaker identity loss on rollout batches. Separate "
+        "from --identity-loss-weight, which charges the same loss on the "
+        "teacher-forced endpoint estimate of an ordinary batch: the two are "
+        "computed on different quantities and their gradient scales differ, so "
+        "one number cannot serve both.",
+    )
+    parser.add_argument(
+        "--identity-rollout-low-band",
+        type=str2bool,
+        default=False,
+        help="Score the rollout's identity on the band the prompt already has. "
+        "The rollout's missing bins are replaced by the target's before "
+        "vocoding, so the two signals differ only below the cutoff and the "
+        "term charges drift in the low band's trajectory, not the invented "
+        "band. Measured on a resample-degraded run: SIM fell as far on outputs "
+        "low-passed at 4 kHz as on full ones, while the low-band L2 against "
+        "the reference solve did not move.",
+    )
+    parser.add_argument(
+        "--rollout-velocity-low-weight",
+        type=float,
+        default=0.0,
+        help="Weight of a running cost along the rollout's solve, after "
+        "VGG-Flow: the squared gap between the adapted and the stock velocity "
+        "at the same state and with the same degraded prompt, over the observed "
+        "bins of the generated span. Zero when the observed band does not "
+        "drift, unlike --rollout-low-weight, whose clean-prompt reference puts "
+        "a floor under it.",
+    )
+    parser.add_argument(
+        "--rollout-velocity-low-steps",
+        type=int,
+        default=16,
+        help="How many solver steps, drawn uniformly, carry the running cost. "
+        "Each one in the ungraphed prefix costs one guided forward's "
+        "activations and one stock forward without a graph.",
+    )
+    parser.add_argument(
+        "--identity-rollout-grad-steps",
+        type=int,
+        default=1,
+        help="How many of the rollout's last solver steps carry a graph "
+        "(DRaFT-K). The solve always starts from noise at t = 0; the steps "
+        "before these run without one. Above 1 the frozen backbone's "
+        "activations are kept on those steps too, so the branch is credited "
+        "for what its residual does to the backbone's later answers; memory "
+        "grows by one guided backbone forward per step.",
+    )
+    parser.add_argument(
+        "--rollout-low-weight",
+        type=float,
+        default=0.0,
+        help="Weight of the L1 between the rollout's sample and the frozen "
+        "model's own solve from the same noise with the clean prompt, over the "
+        "bins the prompt observed. Nonzero with --rollout-high-weight or alone "
+        "turns that reference solve on, which costs another "
+        "--identity-rollout-steps guided forwards without a graph, and needs "
+        "--adapter-trainable adapter so the backbone stays the frozen model.",
+    )
+    parser.add_argument(
+        "--rollout-high-weight",
+        type=float,
+        default=0.0,
+        help="As --rollout-low-weight, over the bins the prompt is missing.",
+    )
+    parser.add_argument(
+        "--rollout-band-level-weight",
+        type=float,
+        default=0.0,
+        help="Weight of the squared difference, per missing bin, between the "
+        "rollout sample's mean log-mel over the generated span and the ground "
+        "truth's. Timing drops out of a mean, so this compares against the real "
+        "recording rather than the frozen model's solve, whose high band sits "
+        "under it. Needs no reference solve.",
+    )
+    parser.add_argument(
+        "--rollout-band-level-underfill",
+        type=str2bool,
+        default=False,
+        help="Charge the band-level term only on bins where the sample is "
+        "darker than the recording. The rollout L2 already covers a band that "
+        "is too loud; what it rewards is a band that is uniformly too dark.",
+    )
+    parser.add_argument(
+        "--rollout-cutoffs",
+        type=str,
+        default="",
+        help="Comma-separated cutoffs in Hz, e.g. 4000,8000. When set, every "
+        "rollout batch is band-limited at one of them, drawn uniformly per "
+        "batch, instead of at the curriculum's cutoff, and its rollout terms "
+        "are also logged per cutoff. Empty keeps the curriculum's draw.",
+    )
+    parser.add_argument(
+        "--rollout-band-level-weights",
+        type=str,
+        default="",
+        help="Comma-separated band-level weights, one per --rollout-cutoffs "
+        "entry, replacing --rollout-band-level-weight for rollouts at that "
+        "cutoff. A band that is darker at one cutoff than another is charged "
+        "harder there without leaning on the other.",
+    )
+    parser.add_argument(
+        "--rollout-distance",
+        type=str,
+        default="l2",
+        choices=["l1", "l2"],
+        help="Distance between the rollout's sample and the reference solve. "
+        "The reference is one deterministic solve, not a distribution over "
+        "plausible bands, so the conditional-median argument for L1 does not "
+        "apply to it.",
+    )
+    parser.add_argument(
+        "--identity-rollout-start-step",
+        type=int,
+        default=0,
+        help="Training batch at which rollout batches begin. Before it every "
+        "batch is an ordinary flow-matching batch, so one run can grow a "
+        "branch on the flow path first and then continue it on its own solve.",
+    )
     parser.add_argument(
         "--drift-loss-weight",
         type=float,
@@ -588,7 +805,7 @@ def add_adapter_arguments(parser: argparse.ArgumentParser) -> None:
         default=0.5,
         help="Finite-difference step the residual is probed at. The backbone's "
         "low-band response is linear in the perturbation -- measured flat to "
-        "within 1% from 1/16 to 2 in fp32 -- so this trades no accuracy and is "
+        "within 1%% from 1/16 to 2 in fp32 -- so this trades no accuracy and is "
         "set by --use-fp16 instead: at 1/16 the difference is smaller than "
         "fp16's spacing at |v|~1 and rounding inflates the term 2.9x, which "
         "falls to 1.02x at 0.5.",
@@ -684,8 +901,99 @@ def add_adapter_arguments(parser: argparse.ArgumentParser) -> None:
         "cutoff, the branch writes the right shape 9-10 dB too quietly. This "
         "term pools the error over tiles of frames and bins before taking the "
         "absolute value, so only each tile's net level offset is charged and "
-        "the unpredictable fine structure is not. Default 0.0 leaves the "
-        "objective unchanged.",
+        "the unpredictable fine structure is not. Charged on the near tier "
+        "only -- see --band-tier-hz. Default 0.0 leaves the objective "
+        "unchanged.",
+    )
+
+    parser.add_argument(
+        "--band-tier-hz",
+        type=float,
+        default=4000.0,
+        help="Where the written band splits into a near tier, whose level a "
+        "regression can honestly target, and a far tier, where it cannot. "
+        "Measured by ridge regression from the whole observed band with +-43 "
+        "ms of context, the per-frame envelope of the first 4 kHz above the "
+        "cutoff is 76%% predictable and everything beyond it 50%%. The split "
+        "follows the cutoff, which is drawn per utterance.",
+    )
+
+    parser.add_argument(
+        "--envelope-loss-weight",
+        type=float,
+        default=0.0,
+        help="Weight of the time-aligned band envelope loss. Every other term "
+        "in this objective is satisfied by a band that is right on average: "
+        "the flow-matching and reconstruction terms charge one element at a "
+        "time, where most of the content is texture the conditioning does not "
+        "determine, and the band loss charges a tile mean, which a band that "
+        "is on at the wrong times matches exactly. This term reduces the tier "
+        "to one number per frame and charges that against the truth frame by "
+        "frame, so energy in a frame that should be silent costs and silence "
+        "in a frame that should carry a fricative costs. The target is a "
+        "legitimate one: the envelope is 50-76%% predictable from the observed "
+        "band where the texture is not, so its L1 has a narrow distribution to "
+        "hedge over. Default 0.0 leaves the objective unchanged.",
+    )
+
+    parser.add_argument(
+        "--envelope-delta-weight",
+        type=float,
+        default=0.0,
+        help="Weight of the frame-to-frame difference of the band envelope. "
+        "This is where a veil is weakest: a band that is on all the time has a "
+        "delta of zero everywhere, while speech steps at every fricative "
+        "onset. Complements --envelope-loss-weight, which a slowly drifting "
+        "offset can still partly satisfy.",
+    )
+
+    parser.add_argument(
+        "--shape-loss-weight",
+        type=float,
+        default=0.0,
+        help="Weight of the per-frame normalised spectral shape of each band "
+        "tier: the L1 between prediction and truth after each frame's mean "
+        "log-mel over the tier is subtracted from both. It charges where the "
+        "energy sits within the band independently of how much there is, "
+        "which --envelope-loss-weight already charges. Same tiers and the same "
+        "--envelope-t-min gate. Default 0.0 leaves the objective unchanged.",
+    )
+
+    parser.add_argument(
+        "--envelope-t-min",
+        type=float,
+        default=0.5,
+        help="Only charge the envelope terms on utterances at least this far "
+        "along the flow. Near t=0 the endpoint estimate is mostly noise and "
+        "its envelope is the envelope of noise, which says nothing about when "
+        "the band should be loud. Same argument and default as "
+        "--adapter-gan-t-min.",
+    )
+
+    parser.add_argument(
+        "--teacher-checkpoint",
+        type=str,
+        default=None,
+        help="A separate frozen copy of the released ZipVoice checkpoint, e.g. "
+        "download/zipvoice/model.pt, used as the clean-prompt teacher. It has "
+        "to be a second checkpoint and not this model under no_grad: "
+        "--adapter-trainable shallow edits the backbone, so a self-teacher is "
+        "a target that drifts with the student and can be matched by moving it.",
+    )
+
+    parser.add_argument(
+        "--teacher-loss-weight",
+        type=float,
+        default=0.0,
+        help="Weight on the squared error between the student's velocity and "
+        "the teacher's, where the teacher is the released model reading the "
+        "*clean* prompt at the same x_t, t, text and lengths. Charged over all "
+        "frequencies of the generated, non-padding region, excluding the "
+        "prompt. Measured on the evaluation set, the teacher's 8-12 kHz band "
+        "sits 13.2 dB above what the same weights produce from an 8 kHz-limited "
+        "prompt and 31.6 dB above the 4 kHz-limited case, so this is the "
+        "behaviour the band losses were describing indirectly. Requires "
+        "--teacher-checkpoint.",
     )
 
     parser.add_argument(
@@ -755,6 +1063,21 @@ def add_adapter_arguments(parser: argparse.ArgumentParser) -> None:
         "trained to call noise fake learns the noise level rather than the "
         "band. Same argument as --perceptual-t-min, kept separate because the "
         "two terms can be weighted and gated independently.",
+    )
+
+    parser.add_argument(
+        "--adapter-gan-tier",
+        type=str,
+        default="all",
+        choices=["all", "far"],
+        help="Which part of the written band the critics may see as generated. "
+        "'all' is the whole band and the previous behaviour. 'far' confines "
+        "them to bins more than --band-tier-hz above the cutoff, leaving the "
+        "near tier spliced in from the truth as context. The near tier has a "
+        "regression target that works -- its envelope already swings correctly "
+        "and only its level is off -- so the critics are not needed there, and "
+        "a critic has a fixed and measurably small amount of leverage to "
+        "spend. This spends it where nothing else can reach.",
     )
 
     # The perceptual terms. Both default to 0, so the recipe is the two-term
@@ -884,6 +1207,41 @@ def gan_enabled(params: AttributeDict) -> bool:
     )
 
 
+def rollout_reference(params: AttributeDict) -> bool:
+    """Whether rollout batches are scored against the frozen model's solve."""
+    return params.rollout_low_weight > 0.0 or params.rollout_high_weight > 0.0
+
+
+def rollout_cutoff_weights(params: AttributeDict) -> Dict[float, float]:
+    """The fixed rollout cutoffs, each mapped to its band-level weight.
+
+    Empty when rollouts take the curriculum's cutoff. Without per-cutoff
+    weights every cutoff gets --rollout-band-level-weight.
+    """
+    if not params.rollout_cutoffs:
+        return {}
+    cutoffs = [float(c) for c in params.rollout_cutoffs.split(",")]
+    if params.rollout_band_level_weights:
+        weights = [float(w) for w in params.rollout_band_level_weights.split(",")]
+        if len(weights) != len(cutoffs):
+            raise ValueError(
+                "--rollout-band-level-weights needs one weight per "
+                "--rollout-cutoffs entry"
+            )
+    else:
+        weights = [params.rollout_band_level_weight] * len(cutoffs)
+    return dict(zip(cutoffs, weights))
+
+
+def rollout_supervised(params: AttributeDict) -> bool:
+    """Whether rollout batches carry a loss that needs no speaker encoder."""
+    return (
+        rollout_reference(params)
+        or params.rollout_band_level_weight > 0.0
+        or any(w > 0.0 for w in rollout_cutoff_weights(params).values())
+    )
+
+
 def discriminator_states(
     discriminators: Optional[Union[nn.Module, DDP]],
     disc_optimizer: Optional[Optimizer],
@@ -980,13 +1338,46 @@ def gan_context(
     rather than masked -- a discriminator has no per-utterance weight, and
     feeding it near-noise endpoints with a zero weight is not available.
     """
-    keep = (aux["t"] >= params.adapter_gan_t_min).nonzero().flatten()
+    # Which bins the critics are allowed to call generated. Under
+    # ``--adapter-gan-tier far`` that is only the part of the band far enough
+    # above the cutoff to have no usable regression target; the near tier is
+    # then spliced in from the truth alongside the low band, so it serves as
+    # context and admits no gradient. The near tier's envelope already swings
+    # correctly and only its level is wrong, which ``band_loss`` corrects
+    # directly, so a critic there would be spending scarce leverage on a
+    # problem already solved.
+    write_mask = aux["band_mask"]
+    if params.adapter_gan_tier == "far":
+        write_mask = write_mask * aux["far_tier"]
+    # Draws with nothing left to invent have real and fake identical after the
+    # splice below: a pair the critic cannot lose on, which only dilutes its
+    # training signal. They are dropped here rather than fed. Under the far
+    # tier this also drops utterances whose cutoff is high enough that the tier
+    # is empty, which a full-band test would have let through.
+    missing = (write_mask > 0).flatten(1).any(dim=1)
+    keep = (
+        ((aux["t"] >= params.adapter_gan_t_min) & missing).nonzero().flatten()
+    )
     if keep.numel() == 0:
         return None
+    features = aux["features"][keep]
+    band_mask = write_mask[keep]
+    # The critics judge only the band the branch invents. Below the cutoff the
+    # fake carries the real mel verbatim, so real and fake are bit-identical
+    # there and no adversarial or feature-matching gradient can reach the low
+    # band -- which is where the identity lives, and where a full-band critic
+    # was found to spend its gradient (2-3 kHz and 3-4 kHz both brightened by
+    # 1-2 dB over the GAN stage, costing 0.065-0.094 SIM-o). Splicing rather
+    # than zeroing keeps the low band as context, which CrossBandDiscriminator
+    # needs for its reference envelope and HarmonicDiscriminator for its
+    # observed partials. The mask is a raised-cosine ramp, not a brick wall, so
+    # this is a blend rather than a select: the gradient each bin admits is
+    # exactly that bin's mask weight, and exactly zero where nothing is missing.
+    x1_hat = features + band_mask * (aux["x1_hat"][keep] - features)
     return {
-        "features": aux["features"][keep],
-        "x1_hat": aux["x1_hat"][keep],
-        "band_mask": aux["band_mask"][keep],
+        "features": features,
+        "x1_hat": x1_hat,
+        "band_mask": band_mask,
         "cutoff_hz": aux["cutoff_hz"][keep],
         "frame_mask": aux["frame_mask"][keep],
         "centers": centers,
@@ -1006,6 +1397,7 @@ def compute_fbank_loss(
     audio: Optional[Tensor] = None,
     audio_lens: Optional[Tensor] = None,
     fbank: Optional[nn.Module] = None,
+    teacher: Optional[nn.Module] = None,
 ) -> Tuple[Tensor, MetricsTracker, Optional[dict]]:
     """
     Compute loss given the model and its inputs.
@@ -1033,6 +1425,10 @@ def compute_fbank_loss(
         written into the checkpoint key by key (``utils/checkpoint.py:110``).
       discriminators:
         The discriminator set, or None when the adversarial terms are off.
+      teacher:
+        The frozen released model that supplies the clean-prompt velocity, or
+        None when that term is off. Passed in for the same reason ``perceptual``
+        is: it must not enter the checkpoint or the averaged model.
 
     Returns the loss, the metrics, and the discriminator context the caller
     needs for the discriminator's own step -- None when the GAN is off or no
@@ -1059,22 +1455,57 @@ def compute_fbank_loss(
     # Waveform-domain band-limiting. The cutoff has to be drawn here rather than
     # left to the model, because the degradation needs it before the forward
     # pass; the model is then handed both, and draws nothing itself.
+    #
+    # Whether this batch is a rollout is drawn here too, and the model is told
+    # the outcome with a probability of 0 or 1. With --rollout-cutoffs a
+    # rollout batch is degraded at one of those cutoffs, and that has to be
+    # known before the waveform is resampled.
+    #
+    # Off during validation. The rollout is 16 guided forwards for one
+    # utterance, and what it reports is a gradient path, not a held-out number
+    # worth spending that on.
+    identity_rollout_steps = (
+        params.identity_rollout_steps
+        if is_training
+        and params.batch_idx_train >= params.identity_rollout_start_step
+        and (
+            rollout_supervised(params)
+            or (
+                perceptual is not None
+                and params.batch_idx_train >= params.perceptual_start_step
+            )
+        )
+        else 0
+    )
+    is_rollout_draw = (
+        identity_rollout_steps > 0
+        and torch.rand(()).item() < params.identity_rollout_prob
+    )
+    cutoff_weights = rollout_cutoff_weights(params)
     cutoff_hz = None
+    if is_rollout_draw and cutoff_weights:
+        cutoffs = list(cutoff_weights)
+        cutoff_hz = torch.full(
+            (batch_size,),
+            cutoffs[int(torch.randint(len(cutoffs), ()))],
+            device=device,
+        )
     masked_features = None
     degraded_audio = None
     if fbank is not None:
         inner = model.module if isinstance(model, DDP) else model
-        cutoff_hz = sample_cutoff(
-            batch_size=features.size(0),
-            step=params.batch_idx_train,
-            total_steps=params.curriculum_steps,
-            f_min=inner.cutoff_min,
-            f_max=inner.cutoff_max,
-            beta=inner.curriculum_beta,
-            rho=inner.curriculum_rho,
-            full_band_prob=inner.full_band_prob,
-            device=device,
-        )
+        if cutoff_hz is None:
+            cutoff_hz = sample_cutoff(
+                batch_size=features.size(0),
+                step=params.batch_idx_train,
+                total_steps=params.curriculum_steps,
+                f_min=inner.cutoff_min,
+                f_max=inner.cutoff_max,
+                beta=inner.curriculum_beta,
+                rho=inner.curriculum_rho,
+                full_band_prob=inner.full_band_prob,
+                device=device,
+            )
         with torch.no_grad():
             masked_features, degraded_audio = resample_band_limit(
                 audio=audio.to(device),
@@ -1084,6 +1515,7 @@ def compute_fbank_loss(
                 num_frames=features.size(1),
                 sampling_rate=params.sampling_rate,
                 return_audio=True,
+                variants=params.degrade_variants,
             )
             masked_features = masked_features.to(features.dtype) * params.feat_scale
 
@@ -1119,8 +1551,28 @@ def compute_fbank_loss(
             curriculum_step=params.batch_idx_train,
             curriculum_total=params.curriculum_steps,
             recon_loss_weight=params.recon_loss_weight,
+            envelope_t_min=params.envelope_t_min,
             masked_features=masked_features,
             speaker_embedder=speaker_embedder,
+            # A callable rather than a module, so nothing about the teacher can
+            # reach the checkpoint. Validation charges it too: whether the two
+            # arms agree with the teacher is exactly what the run is measuring,
+            # so it has to be reported on held-out batches as well.
+            teacher=(
+                (
+                    lambda t, xt, text_condition, speech_condition, padding_mask: (
+                        teacher.forward_fm_decoder(
+                            t=t,
+                            xt=xt,
+                            text_condition=text_condition,
+                            speech_condition=speech_condition,
+                            padding_mask=padding_mask,
+                        )
+                    )
+                )
+                if teacher is not None
+                else None
+            ),
             # The extra backbone forward is a training cost with no bearing on
             # what validation reports, so it is skipped there.
             drift_dt=(
@@ -1134,18 +1586,61 @@ def compute_fbank_loss(
             rollout_prob=params.rollout_prob,
             rollout_decouple=params.rollout_decouple,
             band_fill=params.band_fill,
+            multistep_steps=(params.multistep_steps if params.multistep_loss_weight > 0 else 0),
+            multistep_max_utts=params.multistep_max_utts,
+            # Drawn above: rand() < 1 always holds and rand() < 0 never does.
+            identity_rollout_steps=identity_rollout_steps,
+            identity_rollout_prob=1.0 if is_rollout_draw else 0.0,
+            identity_rollout_guidance=params.identity_rollout_guidance,
+            identity_rollout_t_shift=params.identity_rollout_t_shift,
+            identity_rollout_max_frames=params.identity_rollout_max_frames,
+            identity_rollout_grad_steps=params.identity_rollout_grad_steps,
+            identity_rollout_reference=rollout_reference(params),
+            identity_rollout_distance=params.rollout_distance,
+            identity_rollout_underfill=params.rollout_band_level_underfill,
+            identity_rollout_velocity_steps=(
+                params.rollout_velocity_low_steps
+                if params.rollout_velocity_low_weight > 0.0
+                else 0
+            ),
+        )
+        # Which kind of batch this was. The model has the last word: a drawn
+        # rollout with no band-limited utterance falls back to an ordinary
+        # batch.
+        is_rollout = bool(aux["is_rollout"])
+        rollout_cutoff = (
+            float(aux["cutoff_hz"].reshape(-1)[0]) if is_rollout else 0.0
         )
         variance_loss = aux["variance_loss"]
         drift_loss = aux["drift_loss"]
         band_loss = aux["band_loss"]
         band_bias = aux["band_bias"]
+        envelope_loss = aux["envelope_loss"]
+        envelope_delta_loss = aux["envelope_delta_loss"]
         loss = (
             fm_loss
             + recon_loss
             + params.variance_loss_weight * variance_loss
             + params.drift_loss_weight * drift_loss
             + params.band_loss_weight * band_loss
+            + params.envelope_loss_weight * envelope_loss
+            + params.envelope_delta_weight * envelope_delta_loss
+            + params.shape_loss_weight * aux["shape_loss"]
+            + params.multistep_loss_weight * aux["multistep_loss"]
+            + params.teacher_loss_weight * aux["teacher_loss"]
         )
+        if is_rollout:
+            loss = (
+                loss
+                + params.rollout_low_weight * aux["rollout_low_loss"]
+                + params.rollout_high_weight * aux["rollout_high_loss"]
+                + cutoff_weights.get(
+                    rollout_cutoff, params.rollout_band_level_weight
+                )
+                * aux["rollout_band_level_loss"]
+                + params.rollout_velocity_low_weight
+                * aux["rollout_velocity_low_loss"]
+            )
 
         identity_loss = torch.zeros((), device=device)
         fmatch_loss = torch.zeros((), device=device)
@@ -1157,7 +1652,11 @@ def compute_fbank_loss(
         # and the loss to NaN within 50 steps, for terms multiplied by zero.
         if (
             perceptual is not None
-            and (params.identity_loss_weight > 0.0 or params.fmatch_loss_weight > 0.0)
+            and (
+                params.identity_loss_weight > 0.0
+                or params.fmatch_loss_weight > 0.0
+                or is_rollout
+            )
             and params.batch_idx_train >= params.perceptual_start_step
         ):
             # Only utterances far enough along the flow contribute. Near t=0 the
@@ -1166,21 +1665,54 @@ def compute_fbank_loss(
             # writing the right speaker.
             keep = (aux["t"] >= params.perceptual_t_min).nonzero().flatten()
             keep = keep[: params.perceptual_max_utts]
+            # Whether anything in this batch will actually be weighted. A
+            # weight-zero rollout is the control for a weighted one: it draws
+            # the same batches, spends the same RNG and runs the same solve,
+            # and differs only in the update. Its identity value is still
+            # computed and logged -- that is the counterfactual the comparison
+            # needs -- but under ``no_grad``, so no vocoder graph is built for
+            # a term that would be multiplied by zero.
+            weighted = (
+                params.identity_rollout_weight > 0.0
+                if is_rollout
+                else (
+                    params.identity_loss_weight > 0.0
+                    or params.fmatch_loss_weight > 0.0
+                )
+            )
             if keep.numel() > 0:
                 # fp32: the vocoder's ISTFT overflows readily in half precision,
                 # and the backward pass runs through it.
-                with torch_autocast(dtype=torch.float16, enabled=False):
+                with torch_autocast(dtype=torch.float16, enabled=False), (
+                    contextlib.nullcontext() if weighted else torch.no_grad()
+                ):
+                    x1_hat = aux["x1_hat"]
+                    if is_rollout and params.identity_rollout_low_band:
+                        x1_hat = torch.where(
+                            aux["band_mask"] > 0, aux["features"], x1_hat
+                        )
                     identity_loss, fmatch_loss, num_perceptual = perceptual(
-                        aux["x1_hat"][keep],
+                        x1_hat[keep],
                         aux["features"][keep],
                         aux["span_starts"][keep],
                         aux["span_ends"][keep],
                     )
-                loss = (
-                    loss
-                    + params.identity_loss_weight * identity_loss
-                    + params.fmatch_loss_weight * fmatch_loss
-                )
+                # A rollout batch carries the identity term alone. Feature
+                # matching is a second opinion from the same encoder and its
+                # interaction with a sampled output is unmeasured; adding it
+                # here would make an unattributable change to the objective at
+                # the same moment the generator changed.
+                if is_rollout:
+                    if params.identity_rollout_weight > 0.0:
+                        loss = loss + (
+                            params.identity_rollout_weight * identity_loss
+                        )
+                else:
+                    loss = (
+                        loss
+                        + params.identity_loss_weight * identity_loss
+                        + params.fmatch_loss_weight * fmatch_loss
+                    )
 
     inner = model.module if isinstance(model, DDP) else model
     ctx = None
@@ -1190,7 +1722,7 @@ def compute_fbank_loss(
     # optimising, and without them valid_loss is not comparable to the training
     # loss it is meant to track.
     with torch.set_grad_enabled(is_training):
-        if discriminators is not None and gan_enabled(params):
+        if discriminators is not None and gan_enabled(params) and not is_rollout:
             ctx = gan_context(params, aux, num_frames, inner.mel_centers)
         if ctx is not None:
             # The unwrapped module: these forwards exist to push gradients back
@@ -1239,13 +1771,78 @@ def compute_fbank_loss(
                 # Nothing downstream takes a discriminator step in validation.
                 ctx = None
 
-    assert loss.requires_grad == is_training
+    # A weight-zero rollout batch is the one training case with no graph: its
+    # only term is the identity loss and that term is multiplied by zero, so
+    # the batch is deliberately a no-op on the parameters while still spending
+    # the same draws, the same RNG and the same solve as the weighted run it
+    # controls for.
+    assert loss.requires_grad == (
+        is_training
+        and not (
+            is_rollout
+            and params.identity_rollout_weight <= 0.0
+            and not rollout_supervised(params)
+        )
+    )
 
     info = MetricsTracker()
     info["frames"] = num_frames
+    # Per-type denominators. ``MetricsTracker`` averages ``rollout_*`` keys over
+    # ``rollout_frames`` and everything else over ``fm_frames``, so a rollout
+    # batch cannot make the flow-matching average look better by contributing
+    # frames and a zero, and an ordinary batch cannot do the same to the
+    # identity average. A run with no rollout batches sets ``fm_frames`` equal
+    # to ``frames`` on every batch, which is the behaviour it always had.
+    info["fm_frames"] = 0 if is_rollout else num_frames
+    info["rollout_frames"] = num_frames if is_rollout else 0
+    if is_rollout:
+        # Only the terms this batch actually computed. Logging the rest as
+        # zeros would be logging the wrong quantity, not a missing one.
+        info["rollout_loss"] = loss.detach().cpu().item() * num_frames
+        info["rollout_identity_loss"] = (
+            identity_loss.detach().cpu().item() * num_frames
+        )
+        info["rollout_low_loss"] = (
+            aux["rollout_low_loss"].detach().cpu().item() * num_frames
+        )
+        info["rollout_high_loss"] = (
+            aux["rollout_high_loss"].detach().cpu().item() * num_frames
+        )
+        info["rollout_band_level_loss"] = (
+            aux["rollout_band_level_loss"].detach().cpu().item() * num_frames
+        )
+        info["rollout_velocity_low_loss"] = (
+            aux["rollout_velocity_low_loss"].detach().cpu().item() * num_frames
+        )
+        info["rollout_band_bias"] = (
+            aux["rollout_band_bias"].detach().cpu().item() * num_frames
+        )
+        # With fixed cutoffs, the same terms again under e.g. ``rollout4k_``,
+        # averaged over that cutoff's own frames. The pooled average hides a
+        # band that is right at one cutoff and dark at another.
+        if rollout_cutoff in cutoff_weights:
+            tag = "rollout%gk" % (rollout_cutoff / 1000)
+            info[tag + "_frames"] = num_frames
+            for term in (
+                "low_loss",
+                "high_loss",
+                "band_level_loss",
+                "band_bias",
+                "velocity_low_loss",
+            ):
+                info[tag + "_" + term] = (
+                    aux["rollout_" + term].detach().cpu().item() * num_frames
+                )
+        info["rollout_utts"] = num_perceptual * num_frames
+        info["rollout_residual_rms"] = aux["residual_rms"].cpu().item() * num_frames
+        return loss, info, ctx
     info["fm_loss"] = fm_loss.detach().cpu().item() * num_frames
     info["recon_loss"] = recon_loss.detach().cpu().item() * num_frames
     info["loss"] = loss.detach().cpu().item() * num_frames
+    # Logged unweighted, so the agreement with the teacher can be read off
+    # directly, and separately so its share of ``loss`` is visible rather than
+    # inferred: multiply by --teacher-loss-weight.
+    info["teacher_loss"] = aux["teacher_loss"].detach().cpu().item() * num_frames
     # How hard the branch is pushing. The previous design's failure was a gate
     # pinned at its ceiling at every bandwidth, and it was invisible in a loss
     # shared with everything else; this is the one number that would show the
@@ -1258,11 +1855,28 @@ def compute_fbank_loss(
     # Zero on validation batches by construction; the training curve is the one
     # that says whether the branch is learning to stay out of the low band.
     info["drift_loss"] = drift_loss.detach().cpu().item() * num_frames
+    info["multistep_loss"] = aux["multistep_loss"].detach().cpu().item() * num_frames
+    info["multistep_drift"] = aux["multistep_drift"].detach().cpu().item() * num_frames
     # Logged whatever its weight. It is a level offset in the feature's own log
     # units, so a run that pays for it should show this falling while
     # ``residual_rms`` rises.
     info["band_loss"] = band_loss.detach().cpu().item() * num_frames
     info["band_bias"] = band_bias.detach().cpu().item() * num_frames
+    # Logged whatever their weight, and the three that follow are the ones to
+    # read. ``env_bias`` is the far tier's signed level error and ``env_swing``
+    # its predicted spread against ``env_swing_true``. The distinction they draw
+    # is the whole point of the term: a branch buying level by lifting its floor
+    # closes ``env_bias`` with ``env_swing`` flat, and one learning to turn the
+    # band on closes it with ``env_swing`` rising toward ``env_swing_true``.
+    # The previous run did the first, and no number on its curves said so.
+    info["envelope_loss"] = envelope_loss.detach().cpu().item() * num_frames
+    info["envelope_delta_loss"] = (
+        envelope_delta_loss.detach().cpu().item() * num_frames
+    )
+    info["shape_loss"] = aux["shape_loss"].detach().cpu().item() * num_frames
+    info["env_bias"] = aux["env_bias"].detach().cpu().item() * num_frames
+    info["env_swing"] = aux["env_swing"].detach().cpu().item() * num_frames
+    info["env_swing_true"] = aux["env_swing_true"].detach().cpu().item() * num_frames
     if perceptual is not None:
         info["identity_loss"] = identity_loss.detach().cpu().item() * num_frames
         info["fmatch_loss"] = fmatch_loss.detach().cpu().item() * num_frames
@@ -1291,7 +1905,8 @@ def train_one_epoch(
     world_size: int = 1,
     rank: int = 0,
     perceptual: Optional[nn.Module] = None,
-    fbank: Optional[nn.Module] = None
+    fbank: Optional[nn.Module] = None,
+    teacher: Optional[nn.Module] = None,
 ) -> None:
     """Train the model for one epoch.
 
@@ -1369,6 +1984,7 @@ def train_one_epoch(
                 valid_dl=valid_dl,
                 world_size=world_size,
                 perceptual=perceptual,
+                teacher=teacher,
                 discriminators=discriminators,
                 fbank=fbank,
             )
@@ -1421,6 +2037,7 @@ def train_one_epoch(
                     tokens=tokens,
                     is_training=True,
                     perceptual=perceptual,
+                    teacher=teacher,
                     discriminators=discriminators,
                     audio=audio,
                     audio_lens=audio_lens,
@@ -1438,7 +2055,26 @@ def train_one_epoch(
 
             tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
 
-            scaler.scale(loss).backward()
+            # A weight-zero rollout batch's loss is a constant: there is no
+            # graph to walk, and the gradient it would contribute is exactly
+            # zero. ``defer_update`` below still holds the update, so the
+            # control's optimizer-step count matches the weighted run's.
+            if loss.requires_grad:
+                scaler.scale(loss).backward()
+
+            # A rollout batch's gradient is identity only, and it reaches the
+            # branch and the conditioning encoders alone -- the backbone's
+            # parameters come back with ``grad`` None, which the smoke check
+            # verified. Stepping here anyway would not preserve that: ScaledAdam
+            # replaces a missing gradient with zeros and still applies the
+            # momentum step, so the backbone would drift along its last
+            # flow-matching direction on a batch that taught it nothing. Holding
+            # the gradient until the next ordinary batch keeps the exclusion
+            # exact and gives the backbone precisely the update flow matching
+            # asked for, while the branch gets both terms in one step.
+            defer_update = bool(loss_info.get("rollout_frames", 0)) and (
+                params.identity_rollout_accumulate
+            )
 
             if train_disc:
                 # The generator's loss ran the discriminators and left gradients
@@ -1447,23 +2083,29 @@ def train_one_epoch(
                 disc_optimizer.zero_grad()
                 scaler.scale(disc_loss).backward()
 
-            scheduler.step_batch(params.batch_idx_train)
-            # Use the number of hours of speech to adjust the learning rate
-            if params.lr_hours > 0:
-                scheduler.step_epoch(
-                    params.batch_idx_train
-                    * params.max_duration
-                    * params.world_size
-                    / 3600
-                )
-            scaler.step(optimizer)
-            if train_disc:
-                scaler.step(disc_optimizer)
-            # A single update() per iteration, after every step().
-            scaler.update()
-            optimizer.zero_grad()
-            if train_disc:
-                disc_optimizer.zero_grad()
+            if not defer_update:
+                scheduler.step_batch(params.batch_idx_train)
+                # Use the number of hours of speech to adjust the learning rate
+                if params.lr_hours > 0:
+                    scheduler.step_epoch(
+                        params.batch_idx_train
+                        * params.max_duration
+                        * params.world_size
+                        / 3600
+                    )
+                scaler.step(optimizer)
+                if train_disc:
+                    scaler.step(disc_optimizer)
+                # A single update() per iteration, after every step().
+                scaler.update()
+                # ``set_to_none``: a parameter that receives no gradient on the
+                # next batch is then visibly absent rather than carrying a stale
+                # zero, which is what the rollout's backbone exclusion is read
+                # off. It does not by itself keep ScaledAdam from stepping such
+                # a parameter -- see ``defer_update``.
+                optimizer.zero_grad(set_to_none=True)
+                if train_disc:
+                    disc_optimizer.zero_grad(set_to_none=True)
         except Exception as e:
             logging.info(f"Caught exception : {e}.")
             save_bad_model()
@@ -1583,7 +2225,8 @@ def compute_validation_loss(
     world_size: int = 1,
     perceptual: Optional[nn.Module] = None,
     discriminators: Optional[Union[nn.Module, DDP]] = None,
-    fbank: Optional[nn.Module] = None
+    fbank: Optional[nn.Module] = None,
+    teacher: Optional[nn.Module] = None,
 ) -> MetricsTracker:
     """Run the validation process."""
 
@@ -1623,6 +2266,7 @@ def compute_validation_loss(
             tokens=tokens,
             is_training=False,
             perceptual=perceptual,
+            teacher=teacher,
             discriminators=discriminators,
             audio=audio,
             audio_lens=audio_lens,
@@ -1677,7 +2321,8 @@ def scan_pessimistic_batches_for_oom(
     optimizer: torch.optim.Optimizer,
     params: AttributeDict,
     perceptual: Optional[nn.Module] = None,
-    fbank: Optional[nn.Module] = None
+    fbank: Optional[nn.Module] = None,
+    teacher: Optional[nn.Module] = None,
 ):
     from lhotse.dataset import find_pessimistic_batches
 
@@ -1718,6 +2363,7 @@ def scan_pessimistic_batches_for_oom(
                     tokens=tokens,
                     is_training=True,
                     perceptual=perceptual,
+                    teacher=teacher,
                     audio=audio,
                     audio_lens=audio_lens,
                     fbank=fbank,
@@ -1782,6 +2428,8 @@ def run(rank, world_size, args):
         use_rate_cond=params.use_rate_cond,
         use_pretrained_spk=params.use_pretrained_spk,
         mask_xt=params.mask_xt,
+        steer_all_bins=params.steer_all_bins,
+        lora_rank=params.lora_rank,
     )
     params.update(model_config["model"])
     params.update(model_config["feature"])
@@ -1808,12 +2456,19 @@ def run(rank, world_size, args):
     if (
         params.identity_loss_weight > 0.0
         or params.fmatch_loss_weight > 0.0
+        # A rollout scored only against the reference solve needs no speaker
+        # encoder; one with no reference is the identity rollout, weighted or
+        # its weight-zero control, and needs it either way.
+        or (
+            params.identity_rollout_steps > 0
+            and (params.identity_rollout_weight > 0.0 or not rollout_supervised(params))
+        )
         or model_config["adapter"].get("use_pretrained_spk", False)
     ):
         assert params.speaker_encoder_checkpoint, (
-            "--identity-loss-weight, --fmatch-loss-weight or "
-            "--use-pretrained-spk is set but --speaker-encoder-checkpoint is "
-            "empty"
+            "--identity-loss-weight, --fmatch-loss-weight, "
+            "--identity-rollout-weight or --use-pretrained-spk is set but "
+            "--speaker-encoder-checkpoint is empty"
         )
         perceptual = SpeakerPerceptual(
             speaker_checkpoint=params.speaker_encoder_checkpoint,
@@ -1826,6 +2481,20 @@ def run(rank, world_size, args):
             f"t >= {params.perceptual_t_min}, "
             f"at most {params.perceptual_max_utts} utterances per step"
         )
+        if params.identity_rollout_steps > 0 and params.identity_rollout_prob > 0:
+            logging.info(
+                f"Identity rollout on: weight {params.identity_rollout_weight}, "
+                f"{params.identity_rollout_steps} steps at guidance "
+                f"{params.identity_rollout_guidance} and t_shift "
+                f"{params.identity_rollout_t_shift}, on "
+                f"{params.identity_rollout_prob:.0%} of batches, utterances up "
+                f"to {params.identity_rollout_max_seconds}s, "
+                + (
+                    "folded into the next ordinary update"
+                    if params.identity_rollout_accumulate
+                    else "stepped on their own"
+                )
+            )
 
     if perceptual is not None and model_config["adapter"].get(
         "use_pretrained_spk", False
@@ -1915,6 +2584,45 @@ def run(rank, world_size, args):
             f"{sum(p.numel() for p in discriminators.parameters())}"
         )
 
+    # The clean-prompt teacher. Built here rather than held on the model, for
+    # the same reason the perceptual module and the discriminators are: a
+    # checkpoint has to stay the released tensors plus the branch.
+    #
+    # It is loaded strictly. The student loads the same released weights
+    # non-strictly because its new modules are legitimately absent, but the
+    # teacher is meant to *be* the released model, so a missing or unexpected
+    # tensor here means the wrong file was named, and a teacher that is
+    # quietly part-initialised would teach something other than the measured
+    # ceiling.
+    teacher: Optional[nn.Module] = None
+    if params.teacher_loss_weight > 0.0:
+        assert params.teacher_checkpoint, (
+            "--teacher-loss-weight needs --teacher-checkpoint. The student's "
+            "own backbone cannot serve: --adapter-trainable shallow edits it, "
+            "and no_grad on shared, changing weights is not a fixed teacher."
+        )
+        logging.info(f"Loading clean-prompt teacher from {params.teacher_checkpoint}")
+        # Built under a preserved RNG state. Every tensor of it is overwritten
+        # by the checkpoint a moment later, so its initialisation is discarded
+        # -- but it draws from the global generator all the same, and the two
+        # arms of a controlled comparison have to see the same ``noise``, the
+        # same ``t`` and the same cutoff draws at every step. Without this the
+        # arm that builds a teacher is running on a different random stream
+        # than the arm that does not, and the comparison is not paired.
+        rng_state = torch.get_rng_state()
+        teacher = ZipVoice(**model_config["model"], **tokenizer_config)
+        torch.set_rng_state(rng_state)
+        state = torch.load(
+            params.teacher_checkpoint, map_location="cpu", weights_only=False
+        )["model"]
+        state = {
+            (k[len("module.") :] if k.startswith("module.") else k): v
+            for k, v in state.items()
+        }
+        teacher.load_state_dict(state, strict=True)
+        teacher.eval()
+        teacher.requires_grad_(False)
+
     model_avg: Optional[nn.Module] = None
     if rank == 0:
         # model_avg is only used with rank 0
@@ -1948,8 +2656,28 @@ def run(rank, world_size, args):
     # get_parameter_groups_with_lrs drops parameters whose requires_grad is
     # False -- which is what keeps ScaledAdam's per-tensor scale away from the
     # released weights.
+    # A loss hyperparameter, not architecture: it decides which bins two
+    # training terms charge and nothing the checkpoint carries, so it is set on
+    # the built model rather than passed through ``adapter_kwargs`` into
+    # ``model.json``, where inference would have to keep agreeing with it.
+    model.band_tier_hz = params.band_tier_hz
+
+    # The cap reaches the model in frames, because that is what it can compare
+    # against; seconds are the unit the flag is worth stating in.
+    params.identity_rollout_max_frames = (
+        int(round(params.identity_rollout_max_seconds / VocosFbank().frame_shift))
+        if params.identity_rollout_max_seconds > 0
+        else 0
+    )
+
+    # A branch that writes the low band is meant to correct a frozen backbone,
+    # not to share the job with one that is being moved underneath it.
+    assert not (
+        model_config["adapter"].get("steer_all_bins", False)
+        and params.adapter_trainable != "adapter"
+    ), "--steer-all-bins trains the branch only; use --adapter-trainable adapter"
     model.set_trainable(params.adapter_trainable)
-    trainable = [n for n, p in model.named_parameters() if p.requires_grad]
+    trainable =[n for n, p in model.named_parameters() if p.requires_grad]
     logging.info(
         f"Stage '{params.adapter_trainable}': training "
         f"{sum(p.numel() for p in model.parameters() if p.requires_grad)} "
@@ -1958,11 +2686,18 @@ def run(rank, world_size, args):
     )
 
     model = model.to(params.device)
+    if teacher is not None:
+        teacher = teacher.to(params.device)
 
     # The mel extractor, when band-limiting is done by really resampling. It is
     # the same ``MelSpectrogram`` the precomputed features were made with, so
-    # the observed band of the degraded mel agrees with them; measured, the
-    # below-cutoff L1 between the two is 0.01 log-units.
+    # the observed band of the degraded mel agrees with them closely, but not
+    # exactly: measured on 65 dev utterances, the below-cutoff L1 between the
+    # two is 0.066 log-units at a 4 kHz cutoff and 0.050 at 8 kHz. Of that,
+    # 0.008 is not band-limiting at all -- it is what a cutoff above Nyquist,
+    # which removes nothing, still costs, because this recomputes the mel from
+    # the waveform while the reference was read off disk. The rest is the
+    # resampler's own passband ripple, about half a dB.
     fbank = None
     if params.resample_degrade:
         fbank = VocosFbank().fbank.to(params.device)
@@ -2110,6 +2845,17 @@ def run(rank, world_size, args):
     dev_cuts = dev_cuts.map(_tokenize_text)
 
     train_dl = datamodule.train_dataloaders(train_cuts)
+    # A resumed run continues the epoch where the checkpoint left it rather than
+    # replaying it from the start, so a run branched from a checkpoint sees the
+    # same batches the original run saw after it. The sampler fast-forwards on
+    # load; set_epoch in the loop below is a no-op for the same epoch.
+    if (
+        params.resume_from is not None
+        and checkpoints is not None
+        and checkpoints.get("sampler") is not None
+    ):
+        logging.info("Restoring the training sampler's position")
+        train_dl.sampler.load_state_dict(checkpoints["sampler"])
 
     valid_dl = datamodule.dev_dataloaders(dev_cuts)
 
@@ -2120,6 +2866,7 @@ def run(rank, world_size, args):
             optimizer=optimizer,
             params=params,
             perceptual=perceptual,
+            teacher=teacher,
             fbank=fbank,
         )
 
@@ -2153,6 +2900,7 @@ def run(rank, world_size, args):
             world_size=world_size,
             rank=rank,
             perceptual=perceptual,
+            teacher=teacher,
             fbank=fbank,
         )
 

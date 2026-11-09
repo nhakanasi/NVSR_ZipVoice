@@ -7,9 +7,17 @@ are the ones published with ssr_eval, downloaded on first use.
 
 NVSR works at 44.1 kHz, so a prompt recorded at 8, 16 or 22.05 kHz is
 resampled up, restored, and resampled to the 24 kHz ZipVoice expects. The
-model's own post-processing step is kept: it splices the original low band
-back over the restored one in the STFT domain, so the cascade is measured in
-the configuration its authors recommend.
+observed band is then put back over the restored one by :func:`lfr`, which is
+also the low-frequency replacement lfr.py applies to the bandmask model's own
+prompt fill, so both extensions are spliced by one definition.
+
+NVSR's released post-processing spliced at the bin where the input's
+cumulative energy over frequency reaches 97%. That is an energy quantile, not
+the band edge: on the 8 kHz evaluation prompts it sits near 3.2 kHz, and on the
+16 kHz ones anywhere from 4.5 to 7.3 kHz, so NVSR's resynthesis replaced the
+top of the band the prompt already carried (the bwe_eval nvsr* prompts and the
+Control 2b restorations up to 2026-10-03 were made that way). :func:`lfr`
+splices just below the detected edge instead.
 
 The script needs the ssr_eval source tree only for the NVSR example code,
 which uses flat imports and therefore has to be on sys.path directly. The
@@ -23,11 +31,20 @@ import csv
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 import librosa
 import numpy as np
 import soundfile as sf
 import torch
+
+from zipvoice.models.modules.bwe import (
+    BAND_EDGE_LEAKAGE_BINS,
+    estimate_band_edge,
+    mel_bin_centers,
+)
+from zipvoice.utils.feature import VocosFbank
+from zipvoice.utils.infer import load_prompt_wav
 
 # torchlibrosa, which NVSR's STFT front end uses, calls
 # librosa.util.pad_center(window, n_fft) positionally; librosa made that
@@ -45,29 +62,52 @@ def _pad_center_compat(data, size=None, *args, **kwargs):
 librosa.util.pad_center = _pad_center_compat
 
 NVSR_SR = 44100
+# NVSR's own STFT: librosa's defaults (Hann window) at 44.1 kHz, 21.5 Hz a bin.
+N_FFT, HOP = 2048, 512
+# The splice is centred at this fraction of the band edge, below the
+# resampler's roll-off, and crossfades linearly over this many bins.
+SPLICE_FRACTION = 0.9
+CROSSFADE_BINS = 8
 
 
-def find_cutoff(x: np.ndarray, threshold: float = 0.95) -> int:
-    threshold = x[-1] * threshold
-    for i in range(1, x.shape[0]):
-        if x[-i] < threshold:
-            return x.shape[0] - i
-    return 0
+def band_cutoff(path: Path) -> Optional[float]:
+    """The band edge of a prompt file, in Hz.
+
+    Uses the estimator the bandmask model masks its prompt with, on the prompt
+    loaded as inference loads it, so the cascade and the model take the same
+    edge. The loader matters: the estimator's leakage correction is calibrated
+    on torchaudio's resampler, whose roll-off leaks; a prompt brought to 24 kHz
+    by a sharper one reads about 5 bins lower. Returns None for a prompt whose
+    band reaches the top of the estimator's range: there is nothing to extend.
+    """
+    wav, _ = load_prompt_wav(str(path), 24000)
+    features = VocosFbank().extract(wav[0], 24000)
+    edge = float(estimate_band_edge(features[None], torch.tensor([len(features)]))[0])
+    n_mels = features.shape[-1]
+    if edge >= n_mels - 1:
+        return None
+    centers = mel_bin_centers(n_mels).numpy()
+    return float(np.interp(edge - BAND_EDGE_LEAKAGE_BINS, np.arange(n_mels), centers))
 
 
-def cutoff_index(x: np.ndarray) -> int:
-    energy = np.cumsum(np.sum(np.abs(librosa.stft(x)), axis=-1))
-    return find_cutoff(energy, 0.97)
+def lfr(low: np.ndarray, full: np.ndarray, cutoff: Optional[float]) -> np.ndarray:
+    """Low-frequency replacement: the observed band from ``low``, the rest from
+    ``full``, both 44.1 kHz waveforms.
 
-
-def postprocess(x: np.ndarray, out: np.ndarray) -> np.ndarray:
-    """Splice the observed low band back over the restored signal."""
-    length = out.shape[0]
-    keep = cutoff_index(x)
-    stft_in = librosa.stft(x)
-    stft_out = librosa.stft(out)
-    stft_out[:keep, ...] = stft_in[:keep, ...]
-    return librosa.istft(stft_out, length=length)
+    The STFT (magnitude and phase) takes ``low`` below the splice and ``full``
+    above it, with a linear crossfade of :data:`CROSSFADE_BINS` bins centred at
+    :data:`SPLICE_FRACTION` of ``cutoff`` (Hz). A ``cutoff`` of None returns
+    ``low``.
+    """
+    n = min(len(low), len(full))
+    if cutoff is None:
+        return low[:n]
+    centre = SPLICE_FRACTION * cutoff * N_FFT / NVSR_SR
+    weight = np.clip((centre + CROSSFADE_BINS / 2 - np.arange(N_FFT // 2 + 1)) / CROSSFADE_BINS, 0, 1)
+    spec_low = librosa.stft(low[:n], n_fft=N_FFT, hop_length=HOP)
+    spec_full = librosa.stft(full[:n], n_fft=N_FFT, hop_length=HOP)
+    spec = weight[:, None] * spec_low + (1 - weight[:, None]) * spec_full
+    return librosa.istft(spec, hop_length=HOP, length=n)
 
 
 def from_log(x: torch.Tensor) -> torch.Tensor:
@@ -105,7 +145,8 @@ def load_nvsr(nvsr_dir: Path, device: str):
     return model.eval().to(device)
 
 
-def restore(model, x: np.ndarray, device: str) -> np.ndarray:
+def extend(model, x: np.ndarray, device: str) -> np.ndarray:
+    """NVSR's restoration of a 44.1 kHz waveform, before any splice."""
     with torch.no_grad():
         # (batch, channel, time): wav_to_spectrogram_phase indexes a
         # channel axis, so a bare (1, T) tensor raises IndexError.
@@ -114,7 +155,7 @@ def restore(model, x: np.ndarray, device: str) -> np.ndarray:
         mel = model.mel(sp.permute(0, 1, 3, 2)).permute(0, 1, 3, 2)
         out = model.vocoder(from_log(model(mel)["mel"]), cuda=device == "cuda")
         out = trim_to(out, segment.shape[-1]).squeeze().cpu().numpy()
-    return postprocess(x, np.squeeze(out))
+    return np.squeeze(out)
 
 
 def main() -> None:
@@ -172,12 +213,15 @@ def main() -> None:
                 else:
                     x, _ = librosa.load(source, sr=NVSR_SR)
                     start = time.time()
-                    y = restore(model, x, device)
+                    y = lfr(x, extend(model, x, device), band_cutoff(source))
                     elapsed = time.time() - start
                     y = librosa.resample(
                         y, orig_sr=NVSR_SR, target_sr=args.sampling_rate
                     )
-                    sf.write(out_path, y, args.sampling_rate)
+                    # Float, not soundfile's default 16-bit PCM: the
+                    # quantisation floor alone lifts the observed band's LSD
+                    # against the clean prompt from 0.053 to 0.068 (8 kHz).
+                    sf.write(out_path, y, args.sampling_rate, subtype="FLOAT")
                     restored[source] = out_path
                     timings.append(
                         (

@@ -93,28 +93,59 @@ class MetricsTracker(collections.defaultdict):
                 else:
                     raise ValueError(f"Unexpected key: {k}")
         frames = "%.2f" % self["frames"]
-        ans_frames += "over " + str(frames) + " frames. "
+        ans_frames += "over " + str(frames) + " frames"
+        if self.get("rollout_frames", 0):
+            # Which share of those frames each average was actually taken over.
+            ans_frames += " (fm %.2f, rollout %.2f)" % (
+                self.get("fm_frames", 0),
+                self.get("rollout_frames", 0),
+            )
+        ans_frames += ". "
         if ans_utterances != "":
             utterances = "%.2f" % self["utterances"]
             ans_utterances += "over " + str(utterances) + " utterances."
 
         return ans_frames + ans_utterances
 
+    #: Keys that are denominators rather than metrics, so they are counted but
+    #: never normalised or printed as a rate.
+    DENOMINATORS = ("frames", "utterances", "fm_frames", "rollout_frames")
+
+    def denominator(self, key: str) -> float:
+        """Which frame count ``key`` is an average over.
+
+        Batch types are not interchangeable here. A training step is either an
+        ordinary flow-matching batch or a rollout batch charging the identity
+        loss on a sampled output, and each computes only its own terms. Dividing
+        both by the run's total frames would mean every rollout batch silently
+        improves the flow-matching average and every ordinary batch improves the
+        identity one, purely by contributing frames and a zero.
+
+        So keys named ``rollout_*`` are averaged over ``rollout_frames`` and the
+        rest over ``fm_frames``. A run that never sets those counters falls back
+        to ``frames``, which is what it was before, so earlier curves are
+        unchanged.
+        """
+        # ``get`` rather than ``[]``: this is a defaultdict, and indexing a
+        # missing key would insert it while ``norm_items`` iterates.
+        if "utt_" in key:
+            return self.get("utterances", 0) or 1
+        if key.startswith("rollout"):
+            # ``rollout4k_high_loss`` is over ``rollout4k_frames``: a subset of
+            # rollout batches keeps its own count.
+            return self.get(key.split("_")[0] + "_frames", 0) or 1
+        return self.get("fm_frames", 0) or self.get("frames", 0) or 1
+
     def norm_items(self) -> List[Tuple[str, float]]:
         """
         Returns a list of pairs, like:
           [('ctc_loss', 0.1), ('att_loss', 0.07)]
         """
-        num_frames = self["frames"] if "frames" in self else 1
-        num_utterances = self["utterances"] if "utterances" in self else 1
         ans = []
         for k, v in self.items():
-            if k == "frames" or k == "utterances":
+            if k in self.DENOMINATORS or k.endswith("_frames"):
                 continue
-            norm_value = (
-                float(v) / num_frames if "utt_" not in k else float(v) / num_utterances
-            )
-            ans.append((k, norm_value))
+            ans.append((k, float(v) / self.denominator(k)))
         return ans
 
     def reduce(self, device):

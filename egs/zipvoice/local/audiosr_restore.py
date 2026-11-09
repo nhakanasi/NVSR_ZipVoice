@@ -8,11 +8,19 @@ repository -- the weights are the ones published with AudioSR, downloaded on
 first use.
 
 AudioSR is a latent diffusion model working at 48 kHz, so a prompt recorded at 8
-or 16 kHz is restored there and resampled to the 24 kHz ZipVoice expects. Its own
-post-processing is kept: `LatentDiffusion.postprocessing` splices the observed low
-band back over the restored one in the STFT domain, which is the same
-configuration NVSR was measured in, so the two cascades differ only in the
-extender.
+or 16 kHz is restored there and resampled to the 24 kHz ZipVoice expects. The
+observed band is put back by `nvsr_restore.lfr`, the splice the NVSR cascade
+uses, so the two cascades differ only in the extender.
+
+AudioSR's own `LatentDiffusion.postprocessing` is switched off for that. It
+switches hard at the bin holding 98.5% of the input's cumulative STFT
+magnitude (an energy quantile, like NVSR's released splice, not the band edge)
+and divides the observed band by the output-to-input magnitude ratio at that
+bin, clamped to 0.8-1.2. Prompts made before 2026-10-03 used it. Without it the
+output's level is AudioSR's (peak-normalised to 0.5), so it is brought to the
+input's level over the band below the splice before splicing. AudioSR pads its
+input with zeros to a multiple of 5.12 s at the end; the output is cut back to
+the input's length.
 
 **This script does not run in the main environment.** AudioSR 0.0.7 pins
 `numpy<=1.23.5`, `librosa==0.9.2` and `transformers==4.30.2`; installing that
@@ -25,8 +33,9 @@ main one so torch is shared rather than downloaded twice:
     /c/zipvoice_data/venv_audiosr/Scripts/python -m pip install \
         torchlibrosa progressbar ftfy timm chardet unidecode
 
-Nothing from `zipvoice` is imported here, so running under a different
-interpreter costs nothing.
+The splice comes from `nvsr_restore`, which imports `zipvoice` for the band-edge
+estimator, so the overlay needs the repository on PYTHONPATH; with
+`--system-site-packages` its dependencies are the main environment's.
 
 Usage:
 
@@ -62,8 +71,37 @@ def _pad_center_compat(data, size=None, *args, **kwargs):
 librosa.util.pad_center = _pad_center_compat
 
 from audiosr import build_model, super_resolution  # noqa: E402  (shim above)
+from nvsr_restore import (  # noqa: E402
+    CROSSFADE_BINS,
+    HOP,
+    N_FFT,
+    NVSR_SR,
+    SPLICE_FRACTION,
+    band_cutoff,
+    lfr,
+)
 
 AUDIOSR_SR = 48000
+
+
+def extend(model, source: Path, n: int, **kwargs) -> np.ndarray:
+    """AudioSR's restoration of ``source`` at 44.1 kHz, ``n`` samples long,
+    before any splice and at AudioSR's own level."""
+    y = np.squeeze(super_resolution(model, str(source), **kwargs))
+    y = librosa.resample(y, orig_sr=AUDIOSR_SR, target_sr=NVSR_SR)
+    # The zero padding is at the end, so the first n samples are the input's.
+    return y[:n]
+
+
+def match_level(low: np.ndarray, full: np.ndarray, cutoff) -> np.ndarray:
+    """``full`` scaled to ``low``'s energy over the bins wholly below the
+    splice's crossfade, the band both carry."""
+    if cutoff is None:
+        return full
+    top = int(SPLICE_FRACTION * cutoff * N_FFT / NVSR_SR - CROSSFADE_BINS / 2)
+    a = np.abs(librosa.stft(low, n_fft=N_FFT, hop_length=HOP)[:top]) ** 2
+    b = np.abs(librosa.stft(full, n_fft=N_FFT, hop_length=HOP)[:top]) ** 2
+    return full * np.sqrt(a.sum() / b.sum())
 
 
 def get_parser() -> argparse.ArgumentParser:
@@ -109,6 +147,8 @@ def main() -> None:
         ]
 
     model = build_model(model_name=args.model_name, device="auto")
+    # Replaced by the shared splice below; see the module docstring.
+    model.postprocessing = lambda out, x: out
 
     timings = []
     restored: dict = {}
@@ -130,21 +170,25 @@ def main() -> None:
                 if out_path.is_file():
                     restored[source] = out_path
                 else:
+                    x, _ = librosa.load(source, sr=NVSR_SR)
                     start = time.time()
-                    y = np.squeeze(
-                        super_resolution(
-                            model,
-                            str(source),
-                            seed=args.seed,
-                            guidance_scale=args.guidance_scale,
-                            ddim_steps=args.ddim_steps,
-                        )
+                    cutoff = band_cutoff(source)
+                    full = extend(
+                        model,
+                        source,
+                        len(x),
+                        seed=args.seed,
+                        guidance_scale=args.guidance_scale,
+                        ddim_steps=args.ddim_steps,
                     )
+                    y = lfr(x, match_level(x, full, cutoff), cutoff)
                     elapsed = time.time() - start
                     y = librosa.resample(
-                        y, orig_sr=AUDIOSR_SR, target_sr=args.sampling_rate
+                        y, orig_sr=NVSR_SR, target_sr=args.sampling_rate
                     )
-                    sf.write(out_path, y, args.sampling_rate)
+                    # Float, as in nvsr_restore: 16-bit PCM lifts the
+                    # observed band's error against the clean prompt.
+                    sf.write(out_path, y, args.sampling_rate, subtype="FLOAT")
                     restored[source] = out_path
                     timings.append(
                         (

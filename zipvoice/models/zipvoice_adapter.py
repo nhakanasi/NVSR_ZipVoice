@@ -57,6 +57,7 @@ encoder already pools whatever the mel contains, and the branch's strength is
 now decided by the band mask and by the optimizer rather than by a scalar.
 """
 
+import contextlib
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -81,11 +82,45 @@ from zipvoice.utils.common import condition_time_mask, make_pad_mask
 
 
 # Tile sizes for the multi-resolution band loss, as ``(frames, mel bins)``.
-# The feature rate is 93.75 fps, so these are roughly 85 ms, 340 ms and 1.4 s,
-# over 5, 10 and 20 of the 100 mel bins. The fine end is deliberately not 1x1:
-# that is ``recon_loss``, which this term exists to complement rather than
-# duplicate.
-_BAND_LOSS_TILES = ((8, 5), (32, 10), (128, 20))
+# The feature rate is 93.75 fps, so these are roughly 85 ms and 340 ms, over 5
+# and 10 of the 100 mel bins. The fine end is deliberately not 1x1: that is
+# ``recon_loss``, which this term exists to complement rather than duplicate.
+#
+# A third tile of ``(128, 20)`` -- 1.4 s, close to an utterance's average
+# spectrum -- was dropped. A long-term average spectrum is the one statistic a
+# constant veil matches perfectly, so charging it asks for exactly the failure
+# this arm is trying to remove, and at equal weight it outvoted the one tile
+# short enough to tell a fricative from the vowel beside it.
+_BAND_LOSS_TILES = ((8, 5), (32, 10))
+
+
+# The decoder's Linears that carry the LoRA update, by the last component of
+# their name. Every one reads the (seq, batch, channels) layout the decoder
+# permutes to on entry, which is what lets the per-utterance gate broadcast.
+# Left out: the time and guidance embeddings, which see no speech at all, and
+# ``linear_pos``, which sees only relative positions -- none of them reads the
+# band-limited condition, so a band-dependent correction has nothing to act on
+# there.
+LORA_TARGETS = (
+    "in_proj",
+    "out_proj",
+)
+
+
+def _lora_hook(module: nn.Linear, inputs, output):
+    """Add ``module``'s gated low-rank update to its output.
+
+    ``_lora_gate`` is (batch,) and set by ``forward_fm_decoder`` for the length
+    of one backbone call; outside that window it is None and the Linear is the
+    released one, bit for bit.
+    """
+    gate = module._lora_gate
+    if gate is None:
+        return output
+    x = inputs[0]
+    assert x.dim() == 3 and x.size(1) == gate.numel(), (x.shape, gate.shape)
+    update = F.linear(F.linear(x, module.lora_A), module.lora_B)
+    return output + update * gate.view(1, -1, 1).to(update.dtype)
 
 
 def adapter_kwargs(model_config: Dict, **overrides) -> Dict:
@@ -124,6 +159,7 @@ class ZipVoiceAdapter(ZipVoice):
         write_mask_blur: int = 5,
         sampling_rate: int = 24000,
         feat_scale: float = 0.1,
+        band_tier_hz: float = 4000.0,
         band_transition_bins: float = 3.0,
         band_floor_jitter: float = 0.1,
         band_noise_std: float = 0.0,
@@ -140,6 +176,8 @@ class ZipVoiceAdapter(ZipVoice):
         pretrained_spk_dim: int = 256,
         pretrained_spk_cond_dim: int = 128,
         mask_xt: bool = False,
+        steer_all_bins: bool = False,
+        lora_rank: int = 0,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -155,6 +193,15 @@ class ZipVoiceAdapter(ZipVoice):
         # ``features`` reach the model already multiplied by ``feat_scale``, so
         # the empty-bin floor has to be placed in the same units.
         self.mel_floor = LOG_MEL_FLOOR * feat_scale
+        # Where the written band splits into the tier a regression can reach and
+        # the tier only a distribution can. Measured on the eval references by
+        # ridge regression from the whole observed band with +-43 ms of context:
+        # the per-frame envelope of the first 4 kHz above the cutoff is 76%
+        # predictable (r=0.874) and of everything beyond it 50% (r=0.708). So a
+        # level target is honest near the cutoff and a hedge far from it, and
+        # the split has to follow the cutoff rather than sit at a fixed
+        # frequency, because the cutoff is drawn per utterance.
+        self.band_tier_hz = band_tier_hz
         self.band_transition_bins = band_transition_bins
         self.band_floor_jitter = band_floor_jitter
         self.band_noise_std = band_noise_std
@@ -165,6 +212,14 @@ class ZipVoiceAdapter(ZipVoice):
         # state, so the clean target remains supervision rather than adapter
         # input.
         self.mask_xt = mask_xt
+        # When set, the branch's velocity is not confined to the bins the
+        # prompt is missing: it writes every bin, so it can steer the low band
+        # back when its own high-band writes have pushed the backbone off
+        # course. Architecture, not a dial -- a branch trained this way has
+        # learned to write the low band, and one trained without it never was
+        # -- so it lives in the config and inference reads it from there. See
+        # ``forward_fm_decoder`` and ``identity_rollout``.
+        self.steer_all_bins = steer_all_bins
         self.curriculum_beta = curriculum_beta
         self.curriculum_rho = curriculum_rho
         # Not a trained quantity and not part of the config: an inference dial,
@@ -195,6 +250,15 @@ class ZipVoiceAdapter(ZipVoice):
         self.decouple_residual = False
         # State-level projection, inference-only. See ``_projected_sample``.
         self.project_low_band = False
+        # Inference switch for a checkpoint trained without --resample-degrade.
+        # Such a run only ever saw the mel-domain floor above the cutoff, while
+        # a really band-limited prompt sits about 8.7 log-units higher there, so
+        # the branch is asked at inference to read a band roughly 40 dB hotter
+        # than the one that taught it the band was missing. Setting this puts
+        # the prompt back on the training transform; it is a diagnostic, not a
+        # fix, since it also discards whatever the real prompt left above the
+        # cutoff. See ``sample``.
+        self.prompt_floor = False
         # Filled by ``_projected_sample``: one row per ODE step, read by the
         # caller to see when the low-band divergence appears.
         self.project_trace = None
@@ -208,8 +272,15 @@ class ZipVoiceAdapter(ZipVoice):
         # and the term is noise.
         self._capture_rng = False
         self._rng_state = None
+        # Set only by ``identity_rollout``. See ``forward_fm_decoder``.
+        self._detach_backbone = False
         self._decouple_delta = None
         self._decouple_prev = None
+        # The branch's residual from the previous solver step, fed to the
+        # decoder on the next one. Only carried inside a solve (``sample``,
+        # ``identity_rollout``); see ``_install_lora``.
+        self._carry_residual = False
+        self._prev_residual = None
         # A fraction of every batch is left full-band. The branch is inert there
         # by construction, so this costs it no capacity; what it buys is that the
         # *loss* sees the full-band case, which is the only way training can
@@ -296,6 +367,82 @@ class ZipVoiceAdapter(ZipVoice):
         # full-band guarantee: the mean of a window of zeros is zero.
         self.write_mask_blur = write_mask_blur
 
+        self.lora_rank = lora_rank
+        self._lora_modules: List[nn.Linear] = []
+        self.prev_residual_proj = None
+        if lora_rank > 0:
+            self._install_lora(lora_rank)
+            # What the branch wrote on the previous solver step, projected into
+            # the decoder's input as ``extra_in``. The current step's residual
+            # cannot reach the decoder: the branch reads the decoder's hidden
+            # state, so it is only known after the decoder has run, and feeding
+            # it back would take a second decoder forward. The previous step's
+            # is known before, and it is what the decoder is missing: ``x_t``
+            # already contains that write, mixed in with the decoder's own
+            # trajectory, and the drift is the decoder taking one for the
+            # other. Gated like the LoRA factors, so a full-band prompt still
+            # runs the released decoder; small rather than zero for ScaledAdam.
+            self.prev_residual_proj = nn.Linear(self.feat_dim, decoder_dim)
+            nn.init.normal_(self.prev_residual_proj.weight, std=1e-3)
+            nn.init.zeros_(self.prev_residual_proj.bias)
+
+    def _install_lora(self, rank: int) -> None:
+        """Give the backbone a low-rank update that only a band-limited prompt sees.
+
+        The branch loses identity through the backbone, not through its own
+        writes: the frozen decoder reads the high band the branch wrote into
+        the state and its low band drifts off course. A branch outside the
+        decoder can only answer with more writes. This lets the decoder itself
+        learn to read a band-limited prompt and a branch-written state, in the
+        same single forward.
+
+        The update is gated per utterance on whether the prompt is missing any
+        band. A full-band prompt therefore runs the released decoder exactly,
+        and so does the rollout's clean-prompt reference, which is what keeps
+        that reference the frozen model's solve while these weights train.
+
+        The factors are registered on the Linears they modify, so every
+        released tensor keeps its key and the checkpoint still loads the
+        released weights. ``lora_B`` starts small rather than at zero for the
+        reason given in ``band_adapter.py``: ScaledAdam scales each update by
+        the tensor's own RMS and cannot move one that starts at zero.
+        """
+        for name, module in self.fm_decoder.named_modules():
+            if not (
+                isinstance(module, nn.Linear)
+                and name.rsplit(".", 1)[-1] in LORA_TARGETS
+            ):
+                continue
+            weight = module.weight
+            module.lora_A = nn.Parameter(
+                torch.randn(rank, module.in_features, dtype=weight.dtype)
+                / module.in_features**0.5
+            )
+            module.lora_B = nn.Parameter(
+                torch.randn(module.out_features, rank, dtype=weight.dtype) * 1e-3
+            )
+            module._lora_gate = None
+            module.register_forward_hook(_lora_hook)
+            self._lora_modules.append(module)
+        assert self._lora_modules, "no decoder Linear matched LORA_TARGETS"
+
+    def _set_lora_gate(self, gate: Optional[torch.Tensor]) -> None:
+        for module in self._lora_modules:
+            module._lora_gate = gate
+
+    def _released_decoder_trainable(self) -> bool:
+        """Whether any released decoder tensor is being trained.
+
+        The LoRA factors are excluded: they are gated off whenever the prompt is
+        full band, so the decoder a full-band prompt runs is still the released
+        one while they train.
+        """
+        return any(
+            p.requires_grad
+            for name, p in self.fm_decoder.named_parameters()
+            if not name.endswith(("lora_A", "lora_B"))
+        )
+
     # ------------------------------------------------------------------
     # Conditioning
     # ------------------------------------------------------------------
@@ -317,6 +464,18 @@ class ZipVoiceAdapter(ZipVoice):
             band_mask, kernel_size=k, stride=1, padding=k // 2, count_include_pad=False
         )
 
+    def _band_tiers(self, cutoff_hz: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Split the written band into ``(near, far)`` indicator masks.
+
+        ``near`` is the first ``band_tier_hz`` above the utterance's own cutoff,
+        ``far`` everything beyond. Both are ``(B, 1, F)``, to be multiplied into
+        a write weight rather than used alone -- they say which side of the
+        split a bin is on, not whether it is written.
+        """
+        edge = cutoff_hz.reshape(-1, 1).to(self.mel_centers.dtype) + self.band_tier_hz
+        near = (self.mel_centers.reshape(1, -1) < edge).unsqueeze(1)
+        return near.to(self.mel_centers.dtype), (~near).to(self.mel_centers.dtype)
+
     def _band_limit(
         self, features: torch.Tensor, cutoff_hz: torch.Tensor, randomize: bool
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -334,6 +493,7 @@ class ZipVoiceAdapter(ZipVoice):
             transition_bins=self.band_transition_bins,
             floor_jitter=self.band_floor_jitter if randomize else 0.0,
             noise_std=self.band_noise_std if randomize else 0.0,
+            randomize_transition=randomize,
         )
 
     def forward_fm_decoder(
@@ -440,29 +600,61 @@ class ZipVoiceAdapter(ZipVoice):
         # ordinary flow state and the degraded prompt, and its velocity remains
         # the stock model's prediction. The adapter uses a separate hidden-state
         # path so the clean target cannot reach the branch through ``x_t``.
-        vt, hidden = self.fm_decoder(
-            x=base,
-            t=t_arg,
-            padding_mask=padding_mask,
-            guidance_scale=guidance_scale,
-            return_hidden=True,
+        # ``_detach_backbone`` runs the backbone without a graph. It is set by
+        # ``identity_rollout``, where the identity loss is charged on a sampled
+        # output and the backbone has to stay frozen for the whole solve:
+        # ``hidden`` then reaches the branch as a constant, so the gradient
+        # lands on the branch and the conditioning encoders alone. Two
+        # approximations follow and neither is hidden: the shallow backbone
+        # parameters receive nothing from that term, and the branch is not
+        # credited for how its own residual changes the backbone's later
+        # responses. ``torch.no_grad`` rather than a detach on the outputs, so
+        # the decoder's activations are never stored in the first place.
+        backbone_ctx = (
+            torch.no_grad() if self._detach_backbone else contextlib.nullcontext()
         )
-        if self.mask_xt and band_mask.any():
-            # ``band_mask`` marks bins absent from the prompt. Replace those
-            # bins before the decoder produces the hidden state used by the
-            # adapter; masking hidden channels afterward cannot identify
-            # frequency content because the decoder has already mixed it.
-            hidden_xt = xt * (1.0 - band_mask) + self.mel_floor * band_mask
-            hidden_base = torch.cat(
-                [hidden_xt, text_condition, speech_condition], dim=2
-            )
-            _, hidden = self.fm_decoder(
-                x=hidden_base,
-                t=t_arg,
-                padding_mask=padding_mask,
-                guidance_scale=guidance_scale,
-                return_hidden=True,
-            )
+        # The LoRA update is on for exactly the utterances whose prompt is
+        # missing a band, and only for this call: every other decoder forward
+        # (the drift term, ``multistep_preservation``'s stock reference, the
+        # base class) stays the released model.
+        extra_in = None
+        if self._lora_modules:
+            lora_gate = (band_mask.flatten(1).amax(1) > 0).float()
+            self._set_lora_gate(lora_gate)
+            prev = self._prev_residual if self._carry_residual else None
+            if prev is not None:
+                assert prev.shape == xt.shape, (prev.shape, xt.shape)
+                extra_in = self.prev_residual_proj(prev) * lora_gate.view(-1, 1, 1)
+        try:
+            with backbone_ctx:
+                vt, hidden = self.fm_decoder(
+                    x=base,
+                    t=t_arg,
+                    padding_mask=padding_mask,
+                    guidance_scale=guidance_scale,
+                    extra_in=extra_in,
+                    return_hidden=True,
+                )
+                if self.mask_xt and band_mask.any():
+                    # ``band_mask`` marks bins absent from the prompt. Replace those
+                    # bins before the decoder produces the hidden state used by the
+                    # adapter; masking hidden channels afterward cannot identify
+                    # frequency content because the decoder has already mixed it.
+                    hidden_xt = xt * (1.0 - band_mask) + self.mel_floor * band_mask
+                    hidden_base = torch.cat(
+                        [hidden_xt, text_condition, speech_condition], dim=2
+                    )
+                    _, hidden = self.fm_decoder(
+                        x=hidden_base,
+                        t=t_arg,
+                        padding_mask=padding_mask,
+                        guidance_scale=guidance_scale,
+                        extra_in=extra_in,
+                        return_hidden=True,
+                    )
+        finally:
+            if self._lora_modules:
+                self._set_lora_gate(None)
 
         # Streams are concatenated in the fixed order the constructor sized
         # ``cond_dim`` for: frequency encoder, speaker, rate, pretrained
@@ -513,7 +705,16 @@ class ZipVoiceAdapter(ZipVoice):
         )
         if self.band_fill:
             self._bf_state = self._last_adapter_state
-        residual = residual * self._write_mask(band_mask)
+        if self.steer_all_bins:
+            # Every bin, but still nothing on a full-band prompt: the gate is
+            # per utterance rather than per bin, so the inertness the
+            # full-band draw checks is kept.
+            limited = (band_mask.flatten(1).amax(dim=1) > 0).to(residual.dtype)
+            residual = residual * limited.reshape(-1, 1, 1)
+        else:
+            residual = residual * self._write_mask(band_mask)
+        if self._carry_residual:
+            self._prev_residual = residual
         # Inference-time dose control, 1.0 during training. The branch trades
         # speaker similarity for naturalness -- it fills the missing band with
         # something plausible that is not quite this speaker -- and scaling the
@@ -633,8 +834,10 @@ class ZipVoiceAdapter(ZipVoice):
         curriculum_step: int = 0,
         curriculum_total: int = 0,
         recon_loss_weight: float = 1.0,
+        envelope_t_min: float = 0.5,
         masked_features: Optional[torch.Tensor] = None,
         speaker_embedder: Optional[Callable] = None,
+        teacher: Optional[Callable] = None,
         drift_dt: float = 0.0,
         drift_normalize: bool = False,
         rollout_steps: int = 0,
@@ -642,6 +845,18 @@ class ZipVoiceAdapter(ZipVoice):
         rollout_prob: float = 1.0,
         rollout_decouple: bool = False,
         band_fill: bool = False,
+        multistep_steps: int = 0,
+        multistep_max_utts: int = 1,
+        identity_rollout_steps: int = 0,
+        identity_rollout_prob: float = 0.0,
+        identity_rollout_guidance: float = 0.5,
+        identity_rollout_t_shift: float = 0.5,
+        identity_rollout_max_frames: int = 0,
+        identity_rollout_grad_steps: int = 1,
+        identity_rollout_reference: bool = False,
+        identity_rollout_distance: str = "l1",
+        identity_rollout_underfill: bool = False,
+        identity_rollout_velocity_steps: int = 0,
         **unused,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         """Forward pass for training.
@@ -735,6 +950,153 @@ class ZipVoiceAdapter(ZipVoice):
         if self.pretrained_spk_proj is not None and speaker_embedder is not None:
             embedding, valid_flag = speaker_embedder(speech_condition, prompt_mask)
             speaker_embedding = torch.cat([embedding, valid_flag], dim=-1)
+
+        # Identity supervision on a sampled output.
+        #
+        # A rollout batch does not train the flow-matching objective at all: it
+        # draws one utterance, runs the deployed solve on it, and returns that
+        # sample as ``x1_hat`` so the training script can charge the speaker
+        # identity loss on the thing the model actually emits. Every other term
+        # returns zero and is excluded from its own average by
+        # ``rollout_frames``, so such a batch cannot flatter the reconstruction,
+        # band or envelope curves by scoring them on a different quantity.
+        #
+        # Ordinary batches are untouched: the draw happens here, before any of
+        # the flow-matching state is built.
+        if identity_rollout_steps > 0 and (
+            torch.rand(()).item() < identity_rollout_prob
+        ):
+            clean_condition = (
+                torch.where(speech_condition_mask.unsqueeze(-1), 0, features)
+                if identity_rollout_reference
+                else None
+            )
+            sample, index, reference, velocity_low = self.identity_rollout(
+                noise=noise,
+                text_condition=text_condition,
+                speech_condition=speech_condition,
+                padding_mask=padding_mask,
+                band_mask=band_mask,
+                cutoff_hz=cutoff_hz,
+                prompt_mask=prompt_mask,
+                speaker_embedding=speaker_embedding,
+                num_step=identity_rollout_steps,
+                guidance_scale=identity_rollout_guidance,
+                t_shift=identity_rollout_t_shift,
+                max_frames=identity_rollout_max_frames,
+                grad_steps=identity_rollout_grad_steps,
+                clean_condition=clean_condition,
+                velocity_low_steps=identity_rollout_velocity_steps,
+            )
+            # ``None`` when no utterance in the batch was band-limited, which
+            # the curriculum's full-band draw makes possible. Fall through to
+            # ordinary training rather than return a batch with no gradient.
+            if sample is not None:
+                one = slice(index, index + 1)
+                span_len = speech_condition_mask.sum(dim=1)
+                starts = speech_condition_mask.float().argmax(dim=1)
+                zero = features.new_zeros(())
+                # The sample scored against the frozen model's own solve from
+                # the same noise with the *clean* prompt. Unlike the ground
+                # truth, that reference is aligned with the sample frame by
+                # frame -- same noise, text, guidance and grid -- so a distance
+                # between them is a per-element target rather than a
+                # comparison of two unrelated draws. That also changes the case
+                # for L1 over L2: the median-versus-mean argument against L2
+                # applies to a target with many plausible values, and this one
+                # is a single deterministic solve. Split at the prompt's band
+                # edge: the low half says how far the branch has pulled the
+                # observed band off course, the high half how far it is from
+                # the band a clean prompt would have produced. Generated span
+                # only; the prompt frames are discarded at inference.
+                rollout_low_loss = zero
+                rollout_high_loss = zero
+                span = (
+                    (speech_condition_mask[one] & ~padding_mask[one])
+                    .unsqueeze(-1)
+                    .to(sample.dtype)
+                )
+                high = band_mask[one].to(sample.dtype)
+                # The reference solve's high band is only as good as the frozen
+                # model's, which sits about 3 dB under real speech. The ground
+                # truth has the real level but not the sample's timing, so it is
+                # compared where timing drops out: the mean log-mel of each
+                # missing bin over the generated span. Same text, same span
+                # length, so the two means describe the same utterance.
+                span_frames = span.sum(dim=1).clamp(min=1.0)
+                sample_level = (sample * span).sum(dim=1) / span_frames
+                true_level = (features[one] * span).sum(dim=1) / span_frames
+                high_bins = high.reshape(1, -1)
+                num_high_bins = high_bins.sum().clamp(min=1.0)
+                level_gap = sample_level - true_level
+                # Signed, so the log says whether the band is dark or bright;
+                # the loss alone cannot.
+                rollout_band_bias = (level_gap * high_bins).sum() / num_high_bins
+                # Underfill-only charges a bin only where the sample is darker
+                # than the recording. The rollout L2 already punishes a band
+                # that is too loud or wrong in shape against the reference
+                # solve; what it does not punish is a band that is uniformly
+                # too dark, since that is what squared error drifts to when the
+                # prompt does not determine the band.
+                if identity_rollout_underfill:
+                    level_gap = level_gap.clamp(max=0.0)
+                rollout_band_level_loss = (
+                    level_gap.pow(2) * high_bins
+                ).sum() / num_high_bins
+                if reference is not None:
+                    diff = sample - reference
+                    if identity_rollout_distance == "l1":
+                        err = diff.abs() * span
+                    elif identity_rollout_distance == "l2":
+                        err = diff.pow(2) * span
+                    else:
+                        raise ValueError(identity_rollout_distance)
+                    rollout_low_loss = (err * (1.0 - high)).sum() / (
+                        span * (1.0 - high)
+                    ).sum().clamp(min=1.0)
+                    rollout_high_loss = (err * high).sum() / (
+                        span * high
+                    ).sum().clamp(min=1.0)
+                aux = {
+                    "residual_rms": self._residual_rms,
+                    "rollout_low_loss": rollout_low_loss,
+                    "rollout_high_loss": rollout_high_loss,
+                    "rollout_band_level_loss": rollout_band_level_loss,
+                    "rollout_band_bias": rollout_band_bias,
+                    "rollout_velocity_low_loss": (
+                        zero if velocity_low is None else velocity_low
+                    ),
+                    "multistep_loss": zero,
+                    "multistep_drift": zero,
+                    "variance_loss": zero,
+                    "drift_loss": zero,
+                    "teacher_loss": zero,
+                    "band_loss": zero,
+                    "band_bias": zero,
+                    "envelope_loss": zero,
+                    "envelope_delta_loss": zero,
+                    "shape_loss": zero,
+                    "env_bias": zero,
+                    "env_swing": zero,
+                    "env_swing_true": zero,
+                    "x1_hat": sample,
+                    "features": features[one],
+                    "band_mask": band_mask[one],
+                    "near_tier": torch.zeros_like(band_mask[one]),
+                    "far_tier": torch.zeros_like(band_mask[one]),
+                    "cutoff_hz": cutoff_hz[one],
+                    "frame_mask": (
+                        (~padding_mask[one]).unsqueeze(-1).to(features.dtype)
+                    ),
+                    "span_starts": starts[one],
+                    "span_ends": (starts + span_len)[one],
+                    # The solve ends at t = 1, so the flow-time gate the
+                    # perceptual loss applies to teacher-forced endpoints
+                    # passes here by construction rather than by luck.
+                    "t": features.new_ones(1),
+                    "is_rollout": True,
+                }
+                return zero, zero, aux
 
         # The state the branch is fitted on: the straight line from noise to
         # the target, which is the flow-matching path.
@@ -952,6 +1314,72 @@ class ZipVoiceAdapter(ZipVoice):
         span_mask = speech_condition_mask & valid
         fm_loss = torch.mean((vt[span_mask] - ut[span_mask]) ** 2)
 
+        # Clean-prompt teacher supervision.
+        #
+        # The released model handed an *undegraded* prompt already generates the
+        # band this study is trying to recover. Measured on the evaluation set,
+        # its 8-12 kHz content sits 3.0 dB under the real recording during
+        # speech with a frame-to-frame swing of 42.7 dB, wider than the
+        # recording's own 40.4; the same weights handed an 8 kHz-limited prompt
+        # sit 13.2 dB under it, and handed a 4 kHz-limited one, 31.6 dB under.
+        # So the behaviour is inside the frozen weights and is withheld by the
+        # prompt rather than missing from the model, and it can be supervised
+        # instead of described.
+        #
+        # Every earlier term here described it: a level, an envelope, a
+        # discriminator's opinion. Each specifies a handful of properties of the
+        # output and each has an optimum that is some average -- the per-bin
+        # conditional median for the L1, the per-frame one for the envelope --
+        # which is how a 9-10 dB hedge and then a veil were arrived at. This
+        # term hands over the field itself.
+        #
+        # The teacher is a separate frozen copy of the released checkpoint, not
+        # this model under ``no_grad``. ``--adapter-trainable shallow`` edits the
+        # backbone's 1-D parameters and its two projections, so a self-teacher
+        # would be a target drifting with the student, and matching it would be
+        # satisfiable by moving the target.
+        #
+        # Both forwards see the same ``x_t``, the same ``t``, the same text
+        # condition -- computed from frozen weights, and already carrying this
+        # step's classifier-free-guidance drop -- and the same lengths. The one
+        # difference is the prompt: clean for the teacher, band-limited for the
+        # student. That is the quantity under test.
+        #
+        # Charged over every frequency, not only the invented band. The prompt's
+        # band limit changes how the model reads the speaker, and that reading
+        # moves the whole spectrum; the observed bins are where the teacher's
+        # velocity is least ambiguous, so excluding them discards the most
+        # reliable part of the target. The branch's write mask is untouched, so
+        # the term reaches the observed bins only through the shallow backbone
+        # parameters -- which is the path it is meant to train.
+        #
+        # An MSE against a velocity is not the hedge an endpoint L1 is. Its
+        # optimum is the conditional mean velocity, and that mean *is* the
+        # correct marginal field for the ODE. Residual uncertainty -- many clean
+        # prompts share one degraded prompt -- lands in timbre, where an average
+        # of plausible timbres is itself a timbre. It remains true that agreeing
+        # at these training states does not imply agreeing along a sampled
+        # trajectory; that is what the sampled evaluation is for.
+        teacher_loss = torch.zeros((), device=vt.device, dtype=vt.dtype)
+        if teacher is not None:
+            if x1_hat_solved is not None:
+                raise ValueError(
+                    "Teacher supervision matches a velocity, and the "
+                    "solved-endpoint modes do not predict one."
+                )
+            with torch.no_grad():
+                clean_condition = torch.where(
+                    speech_condition_mask.unsqueeze(-1), 0, features
+                )
+                vt_teacher = teacher(
+                    t=t,
+                    xt=xt,
+                    text_condition=text_condition,
+                    speech_condition=clean_condition,
+                    padding_mask=padding_mask,
+                )
+            teacher_loss = torch.mean((vt[span_mask] - vt_teacher[span_mask]) ** 2)
+
         # Trajectory drift: what the branch's own writes do to the bins it is
         # not allowed to write.
         #
@@ -1088,13 +1516,28 @@ class ZipVoiceAdapter(ZipVoice):
         # smallest still tracks a syllable, the largest is close to the
         # utterance's average spectrum.
         #
-        # Always computed, never gated on its weight: three pooling passes are
+        # Always computed, never gated on its weight: two pooling passes are
         # nothing next to a backbone forward, and a run at weight 0 that logs it
         # says how far the level is off before any run pays to correct it.
+        #
+        # Charged on the ``near`` tier only. Measured on the eval set, the
+        # branch's per-frame envelope over the first 4 kHz above a 4 kHz cutoff
+        # already swings 3.86 against the reference's 3.79 -- the gating there is
+        # right and only the level is wrong, by 1.71 nats -- and in log-mel a
+        # constant offset leaves the swing untouched, so correcting it cannot
+        # smear anything. Beyond the tier the opposite holds: the envelope swing
+        # is 2.35 against 4.08, so the band is failing to turn *on*, and a term
+        # that charges a tile mean would buy the missing level by lifting the
+        # floor. That is what the previous run did unbidden, and is what
+        # ``envelope_loss`` exists to charge instead.
+        near_tier, far_tier = self._band_tiers(cutoff_hz)
+        near_tier = near_tier.to(vt.dtype)
+        far_tier = far_tier.to(vt.dtype)
         band_loss = torch.zeros((), device=vt.device, dtype=vt.dtype)
         band_bias = torch.zeros((), device=vt.device, dtype=vt.dtype)
-        err = ((x1_hat - features) * weight).unsqueeze(1)  # (B, 1, T, F)
-        w = weight.unsqueeze(1)
+        w_near = weight * near_tier
+        err = ((x1_hat - features) * w_near).unsqueeze(1)  # (B, 1, T, F)
+        w = w_near.unsqueeze(1)
         for wt, wf in _BAND_LOSS_TILES:
             # ``count_include_pad`` is irrelevant here because numerator and
             # denominator are pooled identically and any common divisor cancels;
@@ -1181,17 +1624,138 @@ class ZipVoiceAdapter(ZipVoice):
             shortfall = F.relu(true_std - pred_std) * common
             variance_loss = shortfall.sum() / common.sum().clamp(min=1)
 
+        # Time-aligned envelope match on the written band.
+        #
+        # Every other term here is satisfied by a band that is right *on
+        # average*. ``fm_loss`` and ``recon_loss`` charge one element at a time,
+        # and over the invented band most of a single element is texture that
+        # the conditioning does not determine, so their optimum is a point
+        # statistic and the predictable part of the band is a small component of
+        # a gradient dominated by noise. ``band_loss`` charges a tile mean, which
+        # a band that is on at the wrong times matches exactly. Nothing charges
+        # *when*.
+        #
+        # The envelope does, and it is a legitimate regression target in a way
+        # the elements are not. Reduce the tier to one number per frame -- its
+        # mean log-mel -- and that number is largely a function of the observed
+        # band: ridge regression from the whole 0-4 kHz mel with +-43 ms of
+        # context recovers r=0.874 of it above a 4 kHz cutoff and r=0.708
+        # further up, against essentially zero for the texture. So an L1 here
+        # has a narrow conditional distribution to hedge over and lands near the
+        # truth, where the same L1 on the elements lands 9-10 dB under it.
+        #
+        # The headroom is measured, not assumed. That linear predictor's own
+        # output swings 3.43 across frames beyond the tier; the trained branch
+        # manages 2.35 and the reference 4.08. The branch is not extracting what
+        # a least-squares fit on its own input extracts, because nothing asked.
+        #
+        # Two pieces. ``envelope_loss`` charges the level frame by frame, which
+        # is what makes it different from every term above: energy in a frame
+        # that should be silent costs, and silence in a frame that should have a
+        # fricative costs. ``envelope_delta_loss`` charges the frame-to-frame
+        # difference, where a veil is weakest -- a constant band has delta zero
+        # everywhere while speech has a step at every onset.
+        #
+        # The tiers are pooled separately. They sit about 2 nats apart in level,
+        # and one envelope over both would let the louder near tier set the
+        # gradient for a term whose whole purpose is the quieter one.
+        envelope_loss = torch.zeros((), device=vt.device, dtype=vt.dtype)
+        envelope_delta_loss = torch.zeros((), device=vt.device, dtype=vt.dtype)
+        shape_loss = torch.zeros((), device=vt.device, dtype=vt.dtype)
+        env_bias = torch.zeros((), device=vt.device, dtype=vt.dtype)
+        env_swing = torch.zeros((), device=vt.device, dtype=vt.dtype)
+        env_swing_true = torch.zeros((), device=vt.device, dtype=vt.dtype)
+        # Near t=0 the endpoint estimate is mostly noise and its envelope is the
+        # envelope of noise, which carries no information about when the band
+        # should be loud. Same argument, and same default, as the adversarial
+        # and perceptual terms.
+        t_gate = (t.reshape(-1, 1) >= envelope_t_min).to(vt.dtype)  # (B, 1)
+        for tier_idx, tier in enumerate((near_tier, far_tier)):
+            w_tier = weight * tier  # (B, T, F)
+            den = w_tier.sum(dim=2)  # (B, T)
+            # A frame counts only where the tier is actually written. Below the
+            # cutoff there is nothing to invent, and at a high cutoff the far
+            # tier can be empty for the whole utterance; dividing by a weight of
+            # zero would otherwise manufacture an envelope out of the epsilon.
+            fmask = (den > 0.5).to(vt.dtype) * t_gate
+            e_pred = (x1_hat * w_tier).sum(dim=2) / den.clamp(min=1e-4)
+            e_true = (features * w_tier).sum(dim=2) / den.clamp(min=1e-4)
+            envelope_loss = envelope_loss + (
+                (e_pred - e_true).abs() * fmask
+            ).sum() / fmask.sum().clamp(min=1.0)
+            # The spectral shape within the tier, with each frame's level taken
+            # out of both sides, so it is charged independently of the
+            # envelope above: a frame at the right level can still spread its
+            # energy over the wrong bins, and a frame with the right tilt should
+            # not pay twice for being too loud.
+            wf = w_tier * fmask.unsqueeze(-1)
+            s_pred = x1_hat - e_pred.unsqueeze(-1)
+            s_true = features - e_true.unsqueeze(-1)
+            shape_loss = shape_loss + (
+                (s_pred - s_true).abs() * wf
+            ).sum() / wf.sum().clamp(min=1.0)
+            # Both endpoints of a difference have to be real frames of the same
+            # utterance; ``fmask`` is already zero on padding, so the product
+            # drops any pair that straddles the tail.
+            dmask = fmask[:, 1:] * fmask[:, :-1]
+            d_pred = e_pred[:, 1:] - e_pred[:, :-1]
+            d_true = e_true[:, 1:] - e_true[:, :-1]
+            envelope_delta_loss = envelope_delta_loss + (
+                (d_pred - d_true).abs() * dmask
+            ).sum() / dmask.sum().clamp(min=1.0)
+            if tier_idx == 1:
+                # Telemetry for the far tier only, which is the one in doubt.
+                # ``env_bias`` is the signed level error, so a branch buying
+                # level by lifting its floor shows up here as it closes; and the
+                # two swings say whether it bought the level as gating or as
+                # veil, which ``env_bias`` alone cannot tell.
+                n = fmask.sum().clamp(min=1.0)
+                env_bias = ((e_pred - e_true) * fmask).sum() / n
+                mu_p = (e_pred * fmask).sum() / n
+                mu_t = (e_true * fmask).sum() / n
+                env_swing = (
+                    (((e_pred - mu_p) ** 2) * fmask).sum() / n + 1e-8
+                ).sqrt()
+                env_swing_true = (
+                    (((e_true - mu_t) ** 2) * fmask).sum() / n + 1e-8
+                ).sqrt()
+        envelope_loss = envelope_loss / 2.0
+        envelope_delta_loss = envelope_delta_loss / 2.0
+        shape_loss = shape_loss / 2.0
+
         # ``condition_time_mask`` masks one contiguous window per utterance, so
         # the span is recovered from the mask itself rather than plumbed out of
         # it: the first masked frame, and that plus the count.
         span_len = speech_condition_mask.sum(dim=1)
         starts = speech_condition_mask.float().argmax(dim=1)
+        # Preserve original one-step telemetry: rollout forwards update buffers.
+        residual_rms = self._residual_rms
+        multistep_loss = features.new_zeros(())
+        multistep_drift = features.new_zeros(())
+        if multistep_steps > 0:
+            if rollout_steps or band_fill or self.decouple_residual:
+                raise ValueError("Multistep preservation requires ordinary coupled FM training")
+            multistep_loss, multistep_drift = self.multistep_preservation(
+                xt, t, text_condition, speech_condition, padding_mask,
+                band_mask, cutoff_hz, prompt_mask, span_mask,
+                speaker_embedding, multistep_steps, multistep_max_utts,
+            )
         aux = {
-            "residual_rms": self._residual_rms,
+            "residual_rms": residual_rms,
+            "is_rollout": False,
+            "multistep_loss": multistep_loss,
+            "multistep_drift": multistep_drift,
             "variance_loss": variance_loss,
             "drift_loss": drift_loss,
+            "teacher_loss": teacher_loss,
             "band_loss": band_loss,
             "band_bias": band_bias,
+            "envelope_loss": envelope_loss,
+            "envelope_delta_loss": envelope_delta_loss,
+            "shape_loss": shape_loss,
+            "env_bias": env_bias,
+            "env_swing": env_swing,
+            "env_swing_true": env_swing_true,
             "x1_hat": x1_hat,
             "features": features,
             # What a discriminator over the written band has to condition on:
@@ -1200,6 +1764,10 @@ class ZipVoiceAdapter(ZipVoice):
             # recomputing them in the trainer would duplicate the band-limiting
             # draw, which is random per step and would not agree.
             "band_mask": band_mask,
+            # Which side of the tier split each bin is on, so a critic can be
+            # confined to the far tier without recomputing the cutoff draw.
+            "near_tier": near_tier,
+            "far_tier": far_tier,
             "cutoff_hz": cutoff_hz,
             "frame_mask": valid.unsqueeze(-1).to(vt.dtype),
             "span_starts": starts,
@@ -1207,6 +1775,328 @@ class ZipVoiceAdapter(ZipVoice):
             "t": t.reshape(-1),
         }
         return fm_loss, recon_loss, aux
+
+    def identity_rollout(
+        self,
+        noise: torch.Tensor,
+        text_condition: torch.Tensor,
+        speech_condition: torch.Tensor,
+        padding_mask: torch.Tensor,
+        band_mask: torch.Tensor,
+        cutoff_hz: torch.Tensor,
+        prompt_mask: torch.Tensor,
+        speaker_embedding: Optional[torch.Tensor] = None,
+        num_step: int = 16,
+        guidance_scale: float = 0.5,
+        t_shift: float = 0.5,
+        max_frames: int = 0,
+        grad_steps: int = 1,
+        clean_condition: Optional[torch.Tensor] = None,
+        velocity_low_steps: int = 0,
+    ) -> Tuple[
+        Optional[torch.Tensor], int, Optional[torch.Tensor], Optional[torch.Tensor]
+    ]:
+        """Run the deployed solve on one utterance, graphed on the last steps.
+
+        The point of this is the *generator*. Every identity term charged so far
+        scored ``x1_hat = x_t + (1 - t) v_t``, a one-step endpoint estimate from
+        a teacher-forced state, and the clean-prompt teacher run already showed
+        that improving a training-state proxy by 11% left the sampled output
+        slightly worse. So the forward here is the deployed one, not a cheaper
+        relative of it: the same coupled residual (``decouple_residual`` off),
+        the same classifier-free guidance, the same shifted timestep grid, the
+        same number of steps. Reusing ``self.solver.model`` rather than calling
+        ``forward_fm_decoder`` directly is what makes that equality structural
+        -- guidance stacks the unconditional and conditional halves into the
+        batch and rescales itself below t = 0.5, and reimplementing that here is
+        exactly the kind of drift the smoke check exists to catch.
+
+        What is *not* deployed-exact is the gradient. The first
+        ``num_step - 1`` steps run under ``no_grad`` and only the last is built
+        with a graph, on a state that is by then a constant. So the term can
+        teach a local correction at the end of the trajectory; it cannot assign
+        credit to anything the branch did earlier in the solve. The backbone is
+        frozen for the whole path (see ``_detach_backbone``), which removes a
+        second set of paths. Both are approximations, and they are why this is a
+        first implementation of identity supervision on the right output rather
+        than a claim to differentiate through the sampler.
+
+        Cost: exactly ``num_step`` decoder invocations, each at twice the batch
+        because guidance stacks its two halves. The last step is executed once,
+        carrying the graph, not replayed. One utterance, cropped to its own
+        valid length; ``max_frames`` bounds which utterances are eligible, and
+        the choice among those is uniform.
+
+        ``grad_steps`` widens the graphed tail to the last ``K`` steps, after
+        DRaFT-K (Clark et al., 2023): the solve still starts from pure noise at
+        t = 0 on the deployed grid, the first ``num_step - K`` steps still run
+        without a graph, and the last ``K`` are built with one. With ``K > 1``
+        the backbone is graphed on those steps too -- its parameters stay
+        frozen, only its activations are kept -- because what is to be learned
+        is what a residual written at one step does to the backbone's answer at
+        the next, and that path runs through the backbone. With ``K = 1`` there
+        is no later step for it to reach, so the backbone stays detached as
+        before. Memory grows by one guided backbone forward per graphed step.
+
+        ``clean_condition``, when given, also runs the frozen model's own solve
+        from the same noise with that prompt and the branch off, under
+        ``no_grad``, and returns it as the reference the sample is scored
+        against. It is the frozen model only if the backbone is frozen, which
+        is checked.
+
+        ``velocity_low_steps`` charges a running cost along the solve, after
+        VGG-Flow (arXiv 2512.05116): on that many solver steps, drawn uniformly,
+        the squared gap between the adapted velocity and the stock model's
+        velocity at the *same* state and with the *same* degraded prompt, over
+        the observed bins of the generated span, weighted by the step's width.
+        The terminal comparison against the clean-prompt solve cannot see the
+        low-band drift that cost SIM-o: its floor is the gap between a clean and
+        a degraded prompt, about 0.012 whatever the branch does. This one is zero
+        when the branch and LoRA leave the observed band alone, and it
+        constrains every step of the trajectory, not the endpoint. It is a loss,
+        not a projection: nothing is removed from the velocity. A drawn step
+        inside the ungraphed prefix is run with a local graph -- its state stays
+        a constant, and the step's velocity is detached before it moves the
+        state -- so each costs one guided forward's activations. The stock
+        velocity uses the branch-off rule the reference uses (zero band mask),
+        under ``no_grad``.
+
+        Returns the sample, zero-padded back to the batch's frame count, the
+        index of the utterance it belongs to, the reference or None, and the
+        running cost or None; ``(None, -1, None, None)`` when no utterance in
+        the batch was band-limited.
+        """
+        if num_step < 2:
+            raise ValueError("A truncated rollout needs at least two steps")
+        if not 1 <= grad_steps <= num_step:
+            raise ValueError(f"grad_steps {grad_steps} outside [1, {num_step}]")
+        if (
+            clean_condition is not None or velocity_low_steps > 0
+        ) and self._released_decoder_trainable():
+            raise ValueError(
+                "The rollout reference is the frozen model's solve, and the "
+                "backbone is being trained"
+            )
+        if not 0 <= velocity_low_steps <= num_step:
+            raise ValueError(
+                f"velocity_low_steps {velocity_low_steps} outside [0, {num_step}]"
+            )
+        if self.decouple_residual or self.band_fill:
+            raise ValueError(
+                "The rollout reproduces the deployed coupled solve, and these "
+                "modes are a different generator"
+            )
+        valid = (~padding_mask).sum(dim=1)
+        eligible = (band_mask.flatten(1).amax(1) > 0) & (valid > 0)
+        if max_frames > 0:
+            fits = eligible & (valid <= max_frames)
+            # A batch whose every eligible utterance is over the cap still gets
+            # a rollout, on the shortest of them, rather than silently skipping
+            # identity supervision for that step.
+            if bool(fits.any()):
+                eligible = fits
+            else:
+                eligible = eligible & (valid == valid.masked_fill(~eligible, 2**30).min())
+        if not bool(eligible.any()):
+            return None, -1, None, None
+        # Uniform among the eligible utterances. Always taking the shortest
+        # bounds the cost but points identity supervision at the spans carrying
+        # the least speaker evidence, and at the same few utterances again and
+        # again; ``max_frames`` is what bounds the cost instead.
+        choices = eligible.nonzero().flatten()
+        index = int(choices[torch.randint(len(choices), (), device=choices.device)])
+        frames = int(valid[index])
+        one = slice(index, index + 1)
+        x = noise[one, :frames]
+        conditioning = dict(
+            text_condition=text_condition[one, :frames],
+            speech_condition=speech_condition[one, :frames],
+            padding_mask=padding_mask[one, :frames],
+            band_mask=band_mask[one],
+            cutoff_hz=cutoff_hz[one],
+            prompt_mask=prompt_mask[one, :frames],
+            speaker_embedding=(
+                None if speaker_embedding is None else speaker_embedding[one]
+            ),
+            guidance_scale=guidance_scale,
+        )
+        grid = get_time_steps(
+            t_start=0.0,
+            t_end=1.0,
+            num_step=num_step,
+            t_shift=t_shift,
+            device=noise.device,
+        )
+        # Deterministic modules on the whole path, as at inference. Restored
+        # exactly, because the caller is mid-training.
+        modes = [(module, module.training) for module in self.modules()]
+        self.eval()
+        self._detach_backbone = True
+        self._carry_residual = True
+        # Per-call solver state, reset as ``sample`` resets it.
+        self._decouple_delta = None
+        self._decouple_prev = None
+        self._bf_state = None
+        self._prev_residual = None
+        reference = None
+        charged = set(torch.randperm(num_step)[:velocity_low_steps].tolist())
+        stock = dict(conditioning, band_mask=torch.zeros_like(band_mask[one]))
+        # Observed bins of the generated span: the prompt frames are discarded
+        # at inference, and the missing bins are the branch's to write.
+        observed = (
+            (~prompt_mask[one, :frames] & ~padding_mask[one, :frames])
+            .unsqueeze(-1)
+            .to(x.dtype)
+            * (1.0 - band_mask[one].to(x.dtype))
+        )
+        observed_count = observed.sum().clamp(min=1.0)
+        running = []
+
+        def charge(step: int, state: torch.Tensor, velocity: torch.Tensor) -> None:
+            # The stock call would overwrite the branch's carried residual
+            # with its own zero one.
+            carried = self._prev_residual
+            with torch.no_grad():
+                stock_velocity = self.solver.model(t=grid[step], x=state, **stock)
+            self._prev_residual = carried
+            gap = ((velocity - stock_velocity).pow(2) * observed).sum()
+            running.append(gap / observed_count * (grid[step + 1] - grid[step]))
+
+        try:
+            if clean_condition is not None:
+                # Branch off by the model's own rule: a zero band mask declares
+                # the prompt full band, and the residual is then exactly zero.
+                clean = dict(
+                    conditioning,
+                    speech_condition=clean_condition[one, :frames],
+                    band_mask=torch.zeros_like(band_mask[one]),
+                )
+                with torch.no_grad():
+                    reference = x
+                    for step in range(num_step):
+                        velocity = self.solver.model(
+                            t=grid[step], x=reference, **clean
+                        )
+                        reference = reference + velocity * (
+                            grid[step + 1] - grid[step]
+                        )
+                # The reference's residuals are zero, but it is a different
+                # solve, so none of its state carries into the branch's.
+                self._prev_residual = None
+            first_graphed = num_step - grad_steps
+            for step in range(first_graphed):
+                if step in charged:
+                    # A local graph. The LoRA factors live in the backbone, so
+                    # it runs with one here.
+                    self._detach_backbone = False
+                    velocity = self.solver.model(t=grid[step], x=x, **conditioning)
+                    self._detach_backbone = True
+                    charge(step, x, velocity)
+                    velocity = velocity.detach()
+                    if self._prev_residual is not None:
+                        self._prev_residual = self._prev_residual.detach()
+                else:
+                    with torch.no_grad():
+                        velocity = self.solver.model(
+                            t=grid[step], x=x, **conditioning
+                        )
+                x = x + velocity * (grid[step + 1] - grid[step])
+            self._detach_backbone = grad_steps == 1
+            for step in range(first_graphed, num_step):
+                velocity = self.solver.model(t=grid[step], x=x, **conditioning)
+                if step in charged:
+                    charge(step, x, velocity)
+                x = x + velocity * (grid[step + 1] - grid[step])
+            x1 = x
+        finally:
+            self._detach_backbone = False
+            self._carry_residual = False
+            self._prev_residual = None
+            for module, mode in modes:
+                module.training = mode
+        # Normalised by the width the drawn steps cover, so the scale does not
+        # depend on how many were drawn.
+        velocity_low = (
+            torch.stack(running).sum()
+            / sum(float(grid[s + 1] - grid[s]) for s in charged)
+            if running
+            else None
+        )
+        if frames == noise.size(1):
+            return x1, index, reference, velocity_low
+        # Padded back to the batch's frame count so the caller can index it
+        # alongside ``features``; the padding lies outside every span.
+        pad = torch.zeros(
+            1,
+            noise.size(1) - frames,
+            noise.size(2),
+            device=x1.device,
+            dtype=x1.dtype,
+        )
+        if reference is not None:
+            reference = torch.cat([reference, pad], dim=1)
+        return torch.cat([x1, pad], dim=1), index, reference, velocity_low
+
+    def multistep_preservation(
+        self, xt, t, text_condition, speech_condition, padding_mask,
+        band_mask, cutoff_hz, prompt_mask, span_mask,
+        speaker_embedding=None, steps=3, max_utts=1,
+    ):
+        """Differentiate through coupled steps; stock reference stays detached.
+
+        This is a local, conditional Euler-window regularizer, not an on-policy
+        full-synthesis loss. Both continuations start on the same FM bridge.
+        No clean endpoint is imposed on either continuation. The squared drift
+        is divided by elapsed time squared to express the penalty in velocity
+        units. Fully observed bins only; prompt and padding frames are excluded.
+        """
+        if steps < 2 or max_utts < 1:
+            raise ValueError("Use at least two steps and one utterance")
+        if self._released_decoder_trainable():
+            raise ValueError("Multistep preservation requires a frozen backbone")
+        eligible = (band_mask.flatten(1).amax(1) > 0).nonzero().flatten()
+        idx = eligible[:max_utts]
+        if idx.numel() == 0:
+            return xt.new_zeros(()), xt.new_zeros(())
+        x = xt[idx].detach()
+        reference = x.clone()
+        time = t.expand(xt.size(0), 1, 1)[idx].detach()
+        dt = torch.minimum(torch.full_like(time, 1.0 / 16), (1-time) / steps)
+        text = text_condition[idx].detach()
+        speech = speech_condition[idx].detach()
+        padding = padding_mask[idx]
+        mask = band_mask[idx]
+        weight = (mask == 0).float() * span_mask[idx].unsqueeze(-1).float()
+        denominator = weight.sum().clamp(min=1)
+        modes = [(module, module.training) for module in self.modules()]
+        loss = x.new_zeros((), dtype=torch.float32)
+        drift = loss.clone()
+        # Inference-like deterministic modules on both paths. eval() does NOT
+        # disable input gradients through the frozen decoder on the adapted path.
+        self.eval()
+        try:
+            for j in range(steps):
+                tj = time + j * dt
+                with torch.no_grad():
+                    base_v = ZipVoice.forward_fm_decoder(
+                        self, tj, reference, text, speech, padding
+                    )
+                    reference = reference + dt * base_v
+                adapted_v = self.forward_fm_decoder(
+                    t=tj, xt=x, text_condition=text, speech_condition=speech,
+                    padding_mask=padding, band_mask=mask, cutoff_hz=cutoff_hz[idx],
+                    prompt_mask=prompt_mask[idx],
+                    speaker_embedding=(None if speaker_embedding is None else speaker_embedding[idx]),
+                )
+                x = x + dt * adapted_v
+                error = x.float() - reference.float()
+                elapsed = ((j+1) * dt).float().clamp(min=1e-5)
+                loss = loss + ((error / elapsed).square() * weight).sum() / denominator
+                drift = drift + (error.square() * weight).sum().detach() / denominator
+        finally:
+            for module, mode in modes:
+                module.training = mode
+        return loss / steps, drift / steps
 
     def set_trainable(self, mode: str) -> None:
         """Select which parameters the optimiser sees.
@@ -1216,8 +2106,32 @@ class ZipVoiceAdapter(ZipVoice):
         the released checkpoint. ``decoder`` additionally releases the
         flow-matching decoder, and ``all`` releases everything; both exist to
         measure what the restraint costs.
+
+        ``shallow`` sits between ``adapter`` and ``decoder``. A frozen decoder
+        has exactly one trajectory per noise draw, and a residual added to its
+        velocity shoves the state off that path; sixteen Euler steps of a
+        nonlinear field turn the nudge into a different sample, which is
+        measurable as a low band 18 dB from the frozen model's own -- the
+        distance between two unrelated draws. Nothing the branch can learn
+        undoes that, because the weights that would have to absorb it are
+        frozen. This mode releases the smallest set that lets them: every 1-D
+        parameter of the decoder (biases, scales, norm gains) plus the two
+        projections that face the band directly -- ``in_proj``, where the
+        band-limited speech condition enters, and ``out_proj``, the per-bin
+        readout. Roughly 0.4% of the decoder, fewer weights than the branch
+        itself, so the pretrained field is adjusted rather than retrained.
+
+        Note this does not save activation memory: reaching a bias in the first
+        encoder layer still backpropagates through the whole decoder. What it
+        saves is optimiser state, and capacity to forget.
+
+        ``lora`` trains the branch and the decoder's gated LoRA factors (see
+        ``_install_lora``) and no released tensor, so like ``adapter`` it leaves
+        the full-band model bit-identical to the released one.
         """
-        assert mode in ("adapter", "decoder", "all"), mode
+        assert mode in ("adapter", "shallow", "decoder", "all", "lora"), mode
+        if mode == "lora" and not self._lora_modules:
+            raise ValueError("--adapter-trainable lora needs lora_rank > 0")
         if mode == "all":
             self.requires_grad_(True)
             return
@@ -1233,6 +2147,17 @@ class ZipVoiceAdapter(ZipVoice):
         self.adapter.requires_grad_(True)
         if mode == "decoder":
             self.fm_decoder.requires_grad_(True)
+        elif mode == "shallow":
+            for param in self.fm_decoder.parameters():
+                if param.ndim == 1:
+                    param.requires_grad_(True)
+            self.fm_decoder.in_proj.requires_grad_(True)
+            self.fm_decoder.out_proj.requires_grad_(True)
+        elif mode == "lora":
+            for module in self._lora_modules:
+                module.lora_A.requires_grad_(True)
+                module.lora_B.requires_grad_(True)
+            self.prev_residual_proj.requires_grad_(True)
 
     # ------------------------------------------------------------------
     # Inference
@@ -1387,6 +2312,22 @@ class ZipVoiceAdapter(ZipVoice):
         )
         if cutoff_hz is None:
             band_mask = torch.zeros(batch_size, 1, self.feat_dim, device=device)
+        elif self.prompt_floor:
+            # Deliberately the second degradation the branch below declines to
+            # apply: for a checkpoint trained on the mel floor, it is what makes
+            # the prompt's dead band look the way training said a dead band
+            # looks. Deterministic, so the jitter and dead-band noise training
+            # drew per batch are left off. ``band_limit`` floors every frame, so
+            # the non-prompt positions are zeroed again afterwards, matching the
+            # order ``forward`` uses: degrade, then mask.
+            speech_condition, band_mask = self._band_limit(
+                speech_condition, cutoff, randomize=False
+            )
+            speech_condition = torch.where(
+                speech_condition_mask.unsqueeze(-1),
+                torch.zeros_like(speech_condition),
+                speech_condition,
+            )
         else:
             # The prompt arrives already band-limited by its own recording rate,
             # so only the mask is wanted here; re-imposing the floor as well
@@ -1402,25 +2343,36 @@ class ZipVoiceAdapter(ZipVoice):
         self._decouple_delta = None
         self._decouple_prev = None
         self._bf_state = None
+        self._prev_residual = None
 
+        if self.project_low_band and self.steer_all_bins:
+            raise ValueError(
+                "project_low_band overwrites the low band this branch was "
+                "trained to steer"
+            )
         solve = (
             self._projected_sample if self.project_low_band else self.solver.sample
         )
-        x1 = solve(
-            x=x0,
-            text_condition=text_condition,
-            speech_condition=speech_condition,
-            padding_mask=padding_mask,
-            num_step=num_step,
-            guidance_scale=guidance_scale,
-            t_shift=t_shift,
-            band_mask=band_mask,
-            cutoff_hz=cutoff,
-            # Same polarity as training's ``condition_time_mask``: True is the
-            # span being generated, so the prompt is its complement.
-            prompt_mask=~speech_condition_mask & ~padding_mask,
-            speaker_embedding=speaker_embedding,
-        )
+        self._carry_residual = True
+        try:
+            x1 = solve(
+                x=x0,
+                text_condition=text_condition,
+                speech_condition=speech_condition,
+                padding_mask=padding_mask,
+                num_step=num_step,
+                guidance_scale=guidance_scale,
+                t_shift=t_shift,
+                band_mask=band_mask,
+                cutoff_hz=cutoff,
+                # Same polarity as training's ``condition_time_mask``: True is the
+                # span being generated, so the prompt is its complement.
+                prompt_mask=~speech_condition_mask & ~padding_mask,
+                speaker_embedding=speaker_embedding,
+            )
+        finally:
+            self._carry_residual = False
+            self._prev_residual = None
 
         if self.band_fill:
             # The branch predicted a band, not a velocity, so it joins the mel

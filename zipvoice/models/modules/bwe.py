@@ -31,6 +31,7 @@ Contents:
 """
 
 import math
+import random
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -182,6 +183,7 @@ def band_limit(
     transition_bins: float = 3.0,
     floor_jitter: float = 0.0,
     noise_std: float = 0.0,
+    randomize_transition: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Simulate a band-limited prompt by pushing the mel bins above ``cutoff_hz``
@@ -204,6 +206,11 @@ def band_limit(
             actual width is drawn uniformly from ``[0.5, 1.5]`` times this.
         floor_jitter: half-width of the per-utterance uniform jitter on ``floor``.
         noise_std: standard deviation of Gaussian noise added in the dead band.
+        randomize_transition: draw the roll-off width per utterance. False
+            fixes it at ``transition_bins``, which is what inference wants:
+            the width is a training-time randomization like the other two, and
+            leaving it on makes the returned mask -- and so the band the branch
+            is told about -- differ from run to run on identical inputs.
 
     Returns:
         A tuple ``(masked, mask)`` where ``masked`` has the shape of ``features``
@@ -214,9 +221,12 @@ def band_limit(
     device, dtype = features.device, features.dtype
 
     cutoff_bin = hz_to_mel_bin(cutoff_hz.to(dtype), centers).view(b, 1)  # (B, 1)
-    width = transition_bins * (
-        0.5 + torch.rand(b, 1, device=device, dtype=dtype)
-    )  # (B, 1) in [0.5, 1.5] * transition_bins
+    if randomize_transition:
+        width = transition_bins * (
+            0.5 + torch.rand(b, 1, device=device, dtype=dtype)
+        )  # (B, 1) in [0.5, 1.5] * transition_bins
+    else:
+        width = torch.full((b, 1), float(transition_bins), device=device, dtype=dtype)
     width = width.clamp(min=1e-3)
 
     bins = torch.arange(n_mels, device=device, dtype=dtype).view(1, n_mels)
@@ -247,6 +257,7 @@ def resample_band_limit(
     sampling_rate: int = 24000,
     rate_quant: int = 250,
     return_audio: bool = False,
+    variants: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Band-limit by actually resampling the waveform, then re-extracting.
 
@@ -286,6 +297,16 @@ def resample_band_limit(
             continuously, and ``torchaudio.functional.resample`` builds and
             caches a kernel per (from, to) pair; without a grid almost every
             utterance would miss the cache.
+        variants: vary the downsampler per rate group instead of always using
+            the evaluation pipeline's. Half the groups still get exactly that
+            default; the rest draw a different anti-alias filter (width, rolloff,
+            window), and independently an earlier analogue-style roll-off below
+            the cutoff and a small noise floor at the low rate, where a device's
+            ADC or codec adds it, so the upsampler band-limits it as it would.
+            Real devices are low-pass, downsample, upsample: a transition band
+            and a near-dead stopband whose shape depends on hardware that
+            deployment does not tell us. The upsampler is left at the default,
+            which is what the inference loader uses.
 
     Returns:
         The degraded log-mel, of shape ``(B, num_frames, F)``, unscaled -- the
@@ -314,8 +335,33 @@ def resample_band_limit(
         rows = (target == rate).nonzero().flatten()
         wav = audio[rows]
         if rate > 0:
-            # Exactly the evaluation pipeline's degradation, in the same order.
-            down = torchaudio.functional.resample(wav, sampling_rate, rate)
+            # Exactly the evaluation pipeline's degradation, in the same order,
+            # unless ``variants`` draws another downsampler for this group.
+            kw = {}
+            if variants and torch.rand(()) < 0.5:
+                kw = dict(
+                    lowpass_filter_width=int(random.choice((6, 16, 64))),
+                    rolloff=float(torch.empty(()).uniform_(0.85, 0.99)),
+                    resampling_method=random.choice(
+                        ("sinc_interp_hann", "sinc_interp_kaiser")
+                    ),
+                )
+            if variants and torch.rand(()) < 0.3:
+                # An analogue front end that starts rolling off below Nyquist.
+                # lfilter takes only float32 or float64, and the trainer
+                # calls this under fp16 autocast.
+                with torch.autocast(device_type=device.type, enabled=False):
+                    wav = torchaudio.functional.lowpass_biquad(
+                        wav.float(),
+                        sampling_rate,
+                        float(rate / 2.0 * torch.empty(()).uniform_(0.85, 0.95)),
+                    ).to(wav.dtype)
+            down = torchaudio.functional.resample(wav, sampling_rate, rate, **kw)
+            if variants and torch.rand(()) < 0.3:
+                # Noise at -80 to -60 dB against each utterance's RMS.
+                rms = down.pow(2).mean(-1, keepdim=True).sqrt()
+                db = torch.empty_like(rms).uniform_(-80.0, -60.0)
+                down = down + torch.randn_like(down) * rms * 10.0 ** (db / 20.0)
             wav = torchaudio.functional.resample(down, rate, sampling_rate)
             # The round trip can return a sample or two short or long.
             if wav.size(-1) < audio.size(-1):
