@@ -62,6 +62,7 @@ rather than a ``where``, and the transition bins are shared between the two
 trajectories in proportion to how observed they are.
 """
 
+import os
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -575,6 +576,7 @@ class ZipVoiceDual(ZipVoice):
         duration: str = "predict",
         num_step: int = 5,
         guidance_scale: float = 0.5,
+        memory_from_projected: Optional[bool] = None,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """Solve both models from one noise and one timestep grid.
 
@@ -590,6 +592,16 @@ class ZipVoiceDual(ZipVoice):
             prompt, their lengths, the prompt part, and its lengths.
         """
         assert duration in ["real", "predict"]
+
+        # Diagnostic switch, default off, read from the environment so no
+        # caller has to be threaded. See the loop below.
+        # "0" off, "1" a second backbone forward on the projected state for
+        # the branch's memory only, "2" a single forward on the projected state
+        # whose velocity also drives the stock trajectory.
+        mode = os.environ.get("ZIPVOICE_DUAL_MEMORY_FROM_PROJECTED", "0")
+        if memory_from_projected is None:
+            memory_from_projected = mode in ("1", "2")
+        single_forward = mode == "2"
 
         if duration == "predict":
             (
@@ -663,12 +675,31 @@ class ZipVoiceDual(ZipVoice):
 
             v, hidden = self._backbone_step(
                 t=t,
-                x=x,
+                x=y if single_forward else x,
                 text_condition=text_condition,
                 speech_condition=speech_condition,
                 padding_mask=padding_mask,
                 guidance_scale=guidance_scale,
             )
+            if memory_from_projected and not single_forward:
+                # The branch was trained reading a hidden state computed on
+                # ``xt``, which carries the true high band scaled by ``t``. At
+                # inference ``x`` is the stock trajectory, whose high band is
+                # empty, so that channel carries nothing about this utterance's
+                # missing band. Recompute it on the projected state instead,
+                # which carries the branch's own writes -- the same
+                # self-consistent bootstrap the adapter arm gets for free. The
+                # velocity ``v`` still comes from ``x``, so the low band and
+                # hence the identity are unchanged. Costs one extra backbone
+                # forward per step.
+                _, hidden = self._backbone_step(
+                    t=t,
+                    x=y,
+                    text_condition=text_condition,
+                    speech_condition=speech_condition,
+                    padding_mask=padding_mask,
+                    guidance_scale=guidance_scale,
+                )
             u = self.branch(
                 t=t,
                 xt=y,
