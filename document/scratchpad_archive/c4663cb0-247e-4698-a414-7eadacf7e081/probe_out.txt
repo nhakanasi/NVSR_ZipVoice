@@ -1,0 +1,56 @@
+C:/zipvoice_data/exp/dual_rollout/checkpoint-3000.pt  items=16
+detail columns: time-ratio time-corr freq-ratio freq-corr (1,1,1,1 = reference)
+  tf t=0.20 branch  1.314  0.002  2.068 -0.011   backbone(clean)  0.410  0.279  0.403  0.184
+  tf t=0.40 branch  1.024  0.078  1.652 -0.011   backbone(clean)  0.672  0.583  0.423  0.251
+  tf t=0.60 branch  0.763  0.213  1.295 -0.011   backbone(clean)  0.760  0.692  0.461  0.329
+  tf t=0.80 branch  0.589  0.421  1.057 -0.012   backbone(clean)  0.827  0.778  0.582  0.471
+  tf t=0.95 branch  0.569  0.550  1.011 -0.011   backbone(clean)  0.913  0.892  0.825  0.780
+  swap t=0.6 corr to ref time/freq 0.076 -0.013  to swapped-state 0.157 -0.012
+  solve output ratio time/freq 0.756 0.911   backbone(clean) solve 1.115 1.274
+  solve high-band mean level vs ref -1.6 dB (log-mean)
+  seed diversity (seed std / temporal std): high 0.705  low(backbone) 0.695
+  static share of spectral detail: output 0.814  reference 0.128
+  per-step endpoint time-ratio: 1.60 1.56 1.52 1.47 1.42 1.37 1.31 1.26 1.19 1.13 1.06 0.98 0.91 0.84 0.78 0.76
+  per-step endpoint freq-ratio: 2.52 2.45 2.37 2.28 2.19 2.10 2.00 1.89 1.78 1.66 1.53 1.39 1.25 1.11 0.99 0.91
+C:/zipvoice_data/exp/dual_rollout/checkpoint-20000.pt  items=16
+detail columns: time-ratio time-corr freq-ratio freq-corr (1,1,1,1 = reference)
+  tf t=0.20 branch  0.669  0.088  0.910  0.019   backbone(clean)  0.410  0.279  0.403  0.184
+  tf t=0.40 branch  0.592  0.248  0.754  0.025   backbone(clean)  0.672  0.583  0.423  0.251
+  tf t=0.60 branch  0.521  0.454  0.622  0.031   backbone(clean)  0.760  0.692  0.461  0.329
+  tf t=0.80 branch  0.469  0.633  0.545  0.030   backbone(clean)  0.827  0.778  0.582  0.471
+  tf t=0.95 branch  0.461  0.687  0.586  0.023   backbone(clean)  0.913  0.892  0.825  0.780
+  swap t=0.6 corr to ref time/freq 0.109 0.026  to swapped-state 0.384 0.029
+  solve output ratio time/freq 0.328 0.531   backbone(clean) solve 1.115 1.274
+  solve high-band mean level vs ref -4.6 dB (log-mean)
+  seed diversity (seed std / temporal std): high 0.811  low(backbone) 0.695
+  static share of spectral detail: output 0.769  reference 0.128
+  per-step endpoint time-ratio: 0.78 0.76 0.74 0.73 0.72 0.70 0.68 0.66 0.64 0.61 0.58 0.54 0.49 0.44 0.38 0.33
+  per-step endpoint freq-ratio: 1.06 1.04 1.01 0.99 0.95 0.92 0.88 0.84 0.80 0.76 0.71 0.66 0.61 0.57 0.53 0.53
+C:/zipvoice_data/exp/dual_rollout/checkpoint-23000.pt  items=16
+detail columns: time-ratio time-corr freq-ratio freq-corr (1,1,1,1 = reference)
+  tf t=0.20 branch  1.433  0.074  2.440  0.007   backbone(clean)  0.410  0.279  0.403  0.184
+  tf t=0.40 branch  1.447  0.219  2.393  0.008   backbone(clean)  0.672  0.583  0.423  0.251
+  tf t=0.60 branch  1.379  0.409  2.506  0.009   backbone(clean)  0.760  0.692  0.461  0.329
+  tf t=0.80 branch  1.278  0.588  2.666  0.009   backbone(clean)  0.827  0.778  0.582  0.471
+  tf t=0.95 branch  1.212  0.653  2.782  0.008   backbone(clean)  0.913  0.892  0.825  0.780
+  swap t=0.6 corr to ref time/freq 0.109 0.004  to swapped-state 0.324 0.007
+  solve output ratio time/freq 1.624 2.533   backbone(clean) solve 1.115 1.274
+  solve high-band mean level vs ref -6.3 dB (log-mean)
+  seed diversity (seed std / temporal std): high 0.830  low(backbone) 0.695
+  static share of spectral detail: output 0.218  reference 0.128
+  per-step endpoint time-ratio: 1.49 1.47 1.46 1.46 1.47 1.48 1.50 1.51 1.53 1.55 1.57 1.59 1.61 1.62 1.62 1.62
+  per-step endpoint freq-ratio: 2.59 2.54 2.50 2.48 2.46 2.43 2.40 2.37 2.34 2.33 2.32 2.33 2.34 2.37 2.43 2.52
+C:/zipvoice_data/exp/dual_rollout_solve/checkpoint-28000.pt  items=16
+detail columns: time-ratio time-corr freq-ratio freq-corr (1,1,1,1 = reference)
+  tf t=0.20 branch  1.010  0.084  1.207 -0.004   backbone(clean)  0.410  0.279  0.403  0.184
+  tf t=0.40 branch  0.952  0.236  1.047 -0.006   backbone(clean)  0.672  0.583  0.423  0.251
+  tf t=0.60 branch  0.837  0.435  0.930 -0.010   backbone(clean)  0.760  0.692  0.461  0.329
+  tf t=0.80 branch  0.692  0.627  0.864 -0.020   backbone(clean)  0.827  0.778  0.582  0.471
+  tf t=0.95 branch  0.588  0.699  0.909 -0.029   backbone(clean)  0.913  0.892  0.825  0.780
+  swap t=0.6 corr to ref time/freq 0.104 -0.017  to swapped-state 0.354 -0.016
+  solve output ratio time/freq 0.584 0.764   backbone(clean) solve 1.115 1.274
+  solve high-band mean level vs ref -0.9 dB (log-mean)
+  seed diversity (seed std / temporal std): high 0.822  low(backbone) 0.695
+  static share of spectral detail: output 0.752  reference 0.128
+  per-step endpoint time-ratio: 1.07 1.06 1.05 1.05 1.05 1.05 1.05 1.04 1.02 1.01 1.00 0.96 0.91 0.84 0.72 0.58
+  per-step endpoint freq-ratio: 1.41 1.38 1.34 1.30 1.26 1.21 1.17 1.12 1.06 1.01 0.95 0.90 0.84 0.79 0.75 0.74

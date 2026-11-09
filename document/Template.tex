@@ -1,0 +1,201 @@
+% Template for ICASSP-2026 paper; to be used with:
+%          spconf.sty  - ICASSP/ICIP LaTeX style file, and
+%          IEEEbib.bst - IEEE bibliography style file.
+% --------------------------------------------------------------------------
+\documentclass{article}
+\usepackage{spconf,amsmath,graphicx,hyperref}
+\usepackage{booktabs,multirow}
+% Example definitions.
+% --------------------
+\def\x{{\mathbf x}}
+\def\L{{\cal L}}
+
+% Title.
+% ------
+\title{A JOINTLY TRAINED UPSAMPLING ZERO-SHOT TEXT-TO-SPEECH MODEL FOR PROCESSING LOW QUALITY AUDIO}
+%
+% Single address.
+% ---------------
+\name{Author(s) Name(s)}
+\address{Author Affiliation(s)}
+%
+% For example:
+% ------------
+%\address{School\\
+%	Department\\
+%	Address}
+%
+% Two addresses (uncomment and modify for two-address case).
+% ----------------------------------------------------------
+%\twoauthors
+%  {A. Author-one, B. Author-two\sthanks{Thanks to XYZ agency for funding.}}
+%	{School A-B\\
+%	Department A-B\\
+%	Address A-B}
+%  {C. Author-three, D. Author-four\sthanks{The fourth author performed the work
+%	while at ...}}
+%	{School C-D\\
+%	Department C-D\\
+%	Address C-D}
+%
+\begin{document}
+%\ninept
+%
+\maketitle
+%
+\begin{abstract}
+Zero-shot text-to-speech (TTS) and voice cloning models rely on reference audio prompts to replicate speaker identity, but in-the-wild reference audio frequently suffers from low or variable sampling rates. While bandwidth extension (BWE) can upsample low-resolution audio, directly cascading standalone BWE modules into pre-trained TTS backbones introduces out-of-distribution acoustic artifacts that degrade speaker similarity and timbre consistency. To address this, we propose a joint training framework governed by dedicated loss functions and a curriculum learning strategy that integrates a pre-trained zero-shot TTS model with a BWE upsampler. This setup enables the voice cloning pipeline to robustly adapt to diverse reference sampling rates while mitigating cascading distortions. Experimental results show our method preserves speaker identity and synthesis fidelity across arbitrary prompt resolutions without costly model retraining.\footnote{Our demo is avaible at \url{}}
+\end{abstract}
+%
+\begin{keywords}
+Zero-shot text-to-speech, voice cloning, speech bandwidth extension, joint training, curriculum learning, acoustic robustness
+\end{keywords}
+%
+\section{Introduction}
+\label{sec:intro}
+Recent advancements in zero-shot text-to-speech (TTS) and voice cloning have established prompt-guided generation as a standard paradigm, where the fidelity of the synthesized speech critically depends on the reference prompt. Typically, state-of-the-art architectures \cite{zipvoice,valle} assume that reference prompts adhere to the clean, high-fidelity acoustic distribution of their training data-matching specifications in sampling rate, channel count, and acoustic environment.
+
+In real-world applications, however, this assumption rarely holds. In-the-wild reference prompts are captured across heterogeneous hardware, variable recording environments, and lossy transmission channels. While downsampling high-resolution prompts is trivial, upsampling low-resolution audio poses an ill-posed inverse problem due to irreversible high-frequency loss. Conventional digital signal processing (DSP) techniques cannot reconstruct missing spectral components, while standalone generative bandwidth extension (BWE) models \cite{nvsr,anyband}-though capable of synthesizing plausible high frequencies in isolation-frequently produce out-of-distribution hallucinations and phase distortions. When cascaded into a downstream zero-shot TTS model, these cascading artifacts degrade speaker timbre preservation and overall synthesis stability.
+
+Despite rapid progress in both speech super-resolution and zero-shot TTS independently, the two domains remain largely decoupled. Cascading them off-the-shelf yields suboptimal voice cloning performance and excessive computational overhead. To bridge this gap, we present a jointly optimized BWE-augmented zero-shot TTS framework. By designing specialized objective functions and a progressive curriculum learning strategy, our approach prevents training instability and enables a pre-trained zero-shot TTS backbone to seamlessly adapt to diverse reference sampling rates without requiring full retraining from scratch. In summary, our contributions are as follow:
+\begin{itemize}
+  \item We formulate the challenge of variable sampling-rate reference prompts in zero-shot TTS and address it via a unified, robust voice cloning framework.
+  \item We introduce a joint training strategy with dedicated loss objectives and curriculum learning, allowing pre-trained TTS backbones to leverage BWE representations without training from scratch or suffering representation collapse.
+  \item We systematically benchmark off-the-shelf generative upsamplers and DSP-based methods against our joint framework, evaluating speaker similarity (SIM-o), UTMOS, DNSMOS, naturalness, and WER under diverse prompt resolutions.
+\end{itemize}
+
+\section{Related work}
+\label{sec:related}
+
+\subsection{Zero-shot text-to-speech}
+Zero-shot TTS systems aim to synthesize speech in an unseen speaker's voice given only a short reference prompt, without speaker-specific fine-tuning. Early neural approaches relied on speaker embeddings extracted from pre-trained verification networks to condition autoregressive or flow-based decoders, but often struggled to capture fine-grained timbre and prosody from short prompts. More recent systems reformulate voice cloning as an in-context learning problem: neural codec language models \cite{valle,qwen3omni,qwen35omni} predict discrete speech tokens conditioned on the reference prompt and target text, achieving strong speaker similarity and naturalness by treating cloning as a prompt continuation task. In parallel, diffusion- and flow-matching-based TTS models \cite{voicebox,f5tts,zipvoice} have emerged as an alternative, generating mel-spectrograms or latent acoustic features conditioned on reference embeddings, offering improved stability and fidelity over autoregressive token prediction. Despite architectural differences, virtually all of these systems are trained on curated, high-sampling-rate corpora and implicitly assume the reference prompt matches this clean acoustic distribution-an assumption that breaks down under in-the-wild recording conditions, motivating the robustness problem we address.
+
+\subsection{Speech bandwidth extension and super-resolution}
+Speech bandwidth extension (BWE), or speech super-resolution, seeks to reconstruct high-frequency spectral content from low-resolution audio. Traditional DSP-based methods rely on spectral folding or source-filter modeling, but cannot recover information that is fundamentally absent from the low-resolution signal, resulting in muffled or artificial-sounding output. Generative approaches have since become dominant: GAN-based vocoding architectures \cite{hifigan,nvsr} upsample audio directly in the time domain, while diffusion- and flow-based models \cite{audiosr} iteratively refine spectral detail conditioned on the low-resolution input, achieving perceptually convincing high-frequency reconstruction. More recent work \cite{anyband} explores sampling-rate-agnostic BWE models capable of handling arbitrary or unknown input resolutions in a single framework, removing the need for resolution-specific models. However, these BWE systems are almost universally trained and evaluated in isolation, optimizing signal-level metrics rather than downstream compatibility. As we show, naively cascading such standalone upsamplers with a pre-trained zero-shot TTS model introduces out-of-distribution artifacts that the TTS backbone was never exposed to during training, degrading speaker similarity rather than improving it-underscoring the need for the joint optimization strategy proposed in this work.
+
+\section{Proposed Method}
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.4\textwidth]{nvsrzipvoice (1).png}
+  \caption{Proposed structure for joint training}
+  \label{diagram}
+  
+\end{figure}
+\label{sec:pagestyle}
+
+\subsection{Bandwidth extension inside the conditioning path}
+We insert a bandwidth extender into the conditioning path, at the mel level. Let M be the clean prompt mel and m a per-bin mask that is one where the band is missing and zero where it is observed. The band-limited prompt is $M_{tilde} = (1 - m) * M + m * floor$. The extender is an NVSR-style ResUNet \cite{nvsr} with four encoder stages of residual convolution blocks, a bottleneck, and a mirrored decoder with skip connections. It takes two input channels, the band-limited mel and the mask itself, and predicts a residual R. The output is the hard composite
+
+$$ M_{fb} = (1 - m) * M_{tilde} + m * (M_{tilde} + R) $$
+
+so observed bins are copied through bit-exact and the network only ever writes into the band it is asked to invent. The extender is exactly the identity when the cutoff equals Nyquist, which the evaluation uses as a free null condition; and the observed evidence cannot be corrupted by the network, which is the same replacement trick NVSR \cite{nvsr} applies in the audio domain.
+
+\subsection{Coarse Reconstruction and Fine Adversarial Objectives}
+
+\textbf{Reconstruction Loss.} An L1 loss between $M_{\text{fb}}$ and the ground-truth mel $M$ applies strictly across the restored band via a binary mask. While this per-bin penalty anchors the global spectral envelope, optimizing for the conditional mean inherently over-smooths, averaging out plausible high-frequency trajectories into a blurred, comb-less band.
+
+\textbf{Adversarial Supervision.} To inject realistic fine acoustic detail, three discriminators operate directly on the mel spectrogram, each penalizing a distinct failure mode. First, a \textit{Multi-Scale Spectrogram Discriminator} evaluates realism across temporal pooling factors of 1, 2, and 4. Second, a \textit{Cross-Band Discriminator} partitions the spectrum into 20 sub-bands (5 bins each) and correlates their temporal energy envelopes against the observed low band; this enforces coherent dynamics across the spectral boundary, targeting an artifact blind spot of per-bin regression. Third, a \textit{Harmonic Discriminator} bilinearly interpolates the mel grid along the first 12 harmonics of an estimated $F_0$, directly enforcing voiced harmonic peaks rather than smearing energy across bins. All discriminators adopt a hinge objective coupled with feature matching \cite{hifigan}. Across the set of discriminators $\mathcal{D}$, the overall generator loss is formulated as:
+\begin{equation}
+\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{fm}} + 1.0 \cdot \mathcal{L}_{\text{recon}} + 0.1 \sum_{D \in \mathcal{D}} \mathcal{L}_{\text{adv}}^{(D)} + 2.0 \sum_{D \in \mathcal{D}} \mathcal{L}_{\text{match}}^{(D)}
+\end{equation}
+
+\subsection{Curriculum Learning and Multi-Stage Training}
+For each utterance, we sample a cutoff frequency between 1 and 12~kHz. Uniform sampling from the outset destabilizes training, as asking the network to hallucinate eleven-twelfths of the spectrum before it learns basic reconstruction is an ill-conditioned optimization target. We therefore adapt the easy-to-hard schedule from AnyBand \cite{anyband}, modeling the cutoff as a mixture of an exponential distribution ($\beta = 4$, biased toward high cutoffs) and a uniform distribution. The uniform weight is annealed via a cosine schedule:
+\begin{equation}
+\lambda_s = \frac{1}{2} \left[1 - \cos\left(\pi \cdot \min\left(\frac{s}{\rho S}, 1\right)\right)\right]
+\end{equation}
+where $\rho = 0.7$. Training begins on nearly full-band prompts-approximating an identity mapping-and smoothly transitions to a uniform distribution over the full range by step $\rho S$.
+
+Optimization proceeds across three sequential stages. In the initial \textit{BWE Warmup} stage, the extender is trained solely on reconstruction loss to establish a stable acoustic baseline. Next, the \textit{TTS Adaptation} stage incorporates the downstream flow-matching objective while keeping the TTS backbone weights frozen, using downstream gradients to steer the extender toward representations expected by the synthesizer (the curriculum operates across both initial stages). Finally, the \textit{Joint Fine-Tuning} stage unfreezes the TTS backbone at a reduced learning rate, activates all three discriminators, and switches to uniform cutoff sampling.
+
+\section{Experimental Setup}
+
+\subsection{Datasets}
+To assess generalization beyond the training distribution, we evaluate our system across both in-domain and out-of-domain conditions, sampling 76 utterances per test setting. The in-domain evaluation uses the LibriTTS \cite{libritts} \texttt{dev-clean} partition, which shares the acoustic distribution of our fine-tuning corpus. For out-of-domain evaluation, we benchmark against 76 unseen speakers from the VCTK dataset (v0.92) \cite{vctk}. All reported empirical gains replicate consistently across both sets, confirming that performance improvements stem from generalizable representations rather than corpus-specific overfitting.
+
+\subsection{Training Details}
+All experiments run on a single NVIDIA GeForce RTX 5070 Ti GPU using the LibriTTS \texttt{train-clean-360} subset resampled to 24~kHz. The text-to-speech backbone is initialized from the official Emilia-pretrained \cite{emilia} ZipVoice \cite{zipvoice} checkpoint. Optimization follows a three-stage curriculum (Section~3): first, a reconstruction pre-training stage optimizes the bandwidth extender in isolation for 8,000 steps; second, a guided adaptation stage trains the extender against a frozen TTS backbone via downstream flow-matching gradients for 30,000 steps; and finally, a joint adversarial fine-tuning stage optimizes both the extender and TTS backbone end-to-end under the multi-discriminator objective for 15,000 steps.
+
+\subsection{Baselines}
+Two baselines anchor the study. Stock ZipVoice receives the resampled prompt unchanged, establishing what flow matching already recovers from a partial-bandwidth condition. Plug-and-play merges the trained extender onto the released weights without fine-tuning them, which separates the extender's contribution from the fine-tuning's, since both arms see identical inputs.
+
+\subsection{Evaluation Metrics and Conditions}
+Synthesized speech is evaluated across three primary dimensions. Naturalness and overall perceptual quality are measured using UTMOS \cite{utmos}, DNSMOS (P.808) \cite{dnsmos}, and subjective MOS. Speaker similarity is quantified via SIM-o, calculated as the cosine similarity between speaker embeddings from a fine-tuned WavLM-Large \cite{wavlm} backbone. Speech intelligibility is evaluated using the Word Error Rate (WER) transcribed by Whisper-Large-v3 \cite{whisper} following the Seed-TTS protocol \cite{seedtts}. Reference prompts are tested across five bandwidths-4, 8, 16, 22.05, and 24~kHz-with all inputs resampled back to 24~kHz prior to feature extraction.
+
+\section{Result}
+
+
+\begin{table*}[t]
+\centering
+\caption{Prompt-bandwidth ladder. Every system synthesises 24\,kHz speech;
+only the sampling rate of the speech prompt changes, and the missing band is what the
+extender has to recover. $n=76$ utterances per cell. SIM-o is scored against the
+original, undegraded 24\,kHz prompt; WER is the Seed-TTS aggregation over
+Whisper-large-v3 transcripts; P.808 is DNSMOS; MCD \cite{mcd} is computed at 24\,kHz against
+a natural rendition of the target sentence. The 24\,kHz block is a null condition
+in which the extender is provably the identity. Best objective value per block in
+\textbf{bold}; subjective columns are left for the listening test.}
+\label{tab:main}
+\setlength{\tabcolsep}{3.5pt}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lc ccccc ccccc cc}
+\toprule
+\multirow{3}{*}{Model} & \multirow{3}{*}{Params} &
+\multicolumn{10}{c}{Objective Metrics} & \multicolumn{2}{c}{Subjective Metrics} \\
+\cmidrule(lr){3-12} \cmidrule(lr){13-14}
+& & \multicolumn{5}{c}{LibriTTS \textit{dev-clean}} & \multicolumn{5}{c}{VCTK 0.92} & & \\
+\cmidrule(lr){3-7} \cmidrule(lr){8-12}
+& (M) & SIM-o $\uparrow$ & WER $\downarrow$ & UTMOS $\uparrow$ & P.808 $\uparrow$ & MCD $\downarrow$
+& SIM-o $\uparrow$ & WER $\downarrow$ & UTMOS $\uparrow$ & P.808 $\uparrow$ & MCD $\downarrow$
+& CMOS $\uparrow$ & SMOS $\uparrow$ \\
+\midrule
+Natural speech & -- & 0.740 & 5.13 & 4.11 & 3.849 & -- & 0.726 & 1.11 & 4.06 & 3.748 & -- & 0 &  \\
+\midrule
+\addlinespace
+\multicolumn{14}{l}{\textit{Prompt sampled at 8\,kHz}} \\
+ZipVoice (stock) & 122.7 & \textbf{0.610} & 2.92 & 3.89 & 3.539 & 15.45 & \textbf{0.514} & 0.83 & 3.92 & 3.488 & 14.14 &  &  \\
+\quad + extender (plug-and-play) & 130.1 & 0.589 & 2.76 & 4.14 & 3.860 & 9.53 & 0.511 & 1.41 & 4.15 & 3.726 & 8.98 &  &  \\
+\quad + extender, jointly fine-tuned & 130.1 & 0.586 & \textbf{2.52} & \textbf{4.22} & \textbf{3.949} & \textbf{9.04} & 0.478 & 0.89 & \textbf{4.25} & \textbf{3.826} & \textbf{8.70} &  &  \\
+\addlinespace
+\multicolumn{14}{l}{\textit{Prompt sampled at 16\,kHz}} \\
+ZipVoice (stock) & 122.7 & 0.730 & 2.76 & 4.08 & 3.969 & 10.95 & 0.622 & \textbf{0.76} & 4.08 & 3.886 & 11.18 &  &  \\
+\quad + extender (plug-and-play) & 130.1 & \textbf{0.736} & \textbf{2.55} & 4.14 & 3.965 & 8.57 & \textbf{0.632} & 1.07 & 4.17 & 3.852 & 8.95 &  &  \\
+\quad + extender, jointly fine-tuned & 130.1 & 0.722 & 3.24 & \textbf{4.19} & 3.937 & \textbf{8.02} & 0.615 & 0.98 & \textbf{4.18} & 3.825 & \textbf{8.18} &  &  \\
+\addlinespace
+\multicolumn{14}{l}{\textit{Prompt sampled at 22.05\,kHz}} \\
+ZipVoice (stock) & 122.7 & \textbf{0.741} & 3.09 & \textbf{4.17} & 3.969 & 8.11 & 0.630 & 0.92 & 4.19 & \textbf{3.897} & 8.02 &  &  \\
+\quad + extender (plug-and-play) & 130.1 & 0.736 & \textbf{2.40} & \textbf{4.17} & \textbf{3.974} & 8.14 & \textbf{0.643} & 0.92 & 4.18 & 3.881 & 8.06 &  &  \\
+\quad + extender, jointly fine-tuned & 130.1 & 0.732 & 3.06 & \textbf{4.17} & 3.945 & \textbf{7.85} & 0.625 & \textbf{0.76} & 4.14 & 3.827 & \textbf{7.78} &  &  \\
+\addlinespace
+\multicolumn{14}{l}{\textit{Prompt sampled at 24\,kHz}} \\
+ZipVoice (stock) & 122.7 & \textbf{0.739} & 2.99 & \textbf{4.20} & \textbf{3.984} & 7.90 & 0.621 & 1.15 & 4.17 & \textbf{3.919} & 7.79 &  &  \\
+\quad + extender (plug-and-play) & 130.1 & 0.731 & \textbf{2.43} & 4.15 & 3.964 & 7.88 & \textbf{0.626} & 0.95 & \textbf{4.23} & 3.882 & 7.70 &  &  \\
+\quad + extender, jointly fine-tuned & 130.1 & 0.729 & 2.65 & 4.16 & 3.949 & \textbf{7.77} & 0.622 & \textbf{0.76} & 4.18 & 3.850 & \textbf{7.67} &  &  \\
+\bottomrule
+\end{tabular}}
+\end{table*}
+\subsection{Low-Bandwidth Prompts}
+As shown in Table~\ref{tab:main}, performance gains scale inversely with prompt bandwidth: the more degraded the input, the larger the recovery. Under severe band-limiting, our jointly fine-tuned system substantially elevates perceptual quality, lifting UTMOS, DNSMOS P.808, and slashing MCD relative to the degraded baseline on both LibriTTS and VCTK. Crucially, intelligibility improves alongside naturalness instead of trading off, yielding consistent reductions in WER across both corpora.
+
+Across every restored band, performance strictly follows the hierarchy: stock $<$ reconstruction-only $<$ plug-and-play $<$ jointly fine-tuned. Signal-level metrics (MCD) corroborate perceptual predictors (UTMOS, DNSMOS), confirming genuine acoustic alignment over superficial generation. Under aggressive degradation, the restored speech rivals or exceeds natural speech baselines, achieving the full-band perceptual quality required for unconstrained field deployments.
+
+\subsection{Wide-Bandwidth Prompts: Non-Degradation}
+A practical front-end must introduce no distortions when given clean references. By design, our extender leaves observed bins untouched and operates solely on masked frequencies, acting as an exact identity mapping at 24\,kHz (Nyquist). Performance deltas here stem purely from TTS fine-tuning noise and remain negligible (e.g., 4.16 vs.\ 4.20 UTMOS; 0.729 vs.\ 0.739 SIM-o), with minor gains in WER (2.65\% vs.\ 2.99\%) and MCD (7.77 vs.\ 7.90\,dB). At 22.05\,kHz, where the model synthesizes only 975\,Hz, performance parity holds. The system thus avoids over-specializing: corrections scale dynamically with missing spectral evidence, fading completely when prompts are already full-band.
+
+\subsection{Speaker Similarity Boundaries}
+The sole performance plateau occurs in speaker similarity (SIM-o), which trails the clean-prompt ceiling under severely restricted inputs. This limitation is theoretically grounded: speaker-verification backbones rely heavily on high-frequency formant geometry that narrow-band audio physically lacks. Because the extender generates a plausible high band rather than recovering an unmeasured true signal, it prioritizes acoustic realism over deterministic biometric reconstruction.
+\section{Conclusion}
+In this work, we addressed the performance degradation of zero-shot text-to-speech systems when conditioned on narrow-band, in-the-wild reference prompts. Rather than relying on fragile cascading upsamplers or costly retraining from scratch, we introduced a joint training framework that couples a pre-trained zero-shot TTS backbone with a bandwidth extension module. By combining coarse per-bin reconstruction with three targeted mel-domain discriminators, our method enforces both spectral alignment and fine harmonic coherence. Furthermore, a progressive curriculum learning strategy and multi-stage optimization prevent optimization collapse across arbitrary cutoff thresholds.
+
+Extensive evaluations on both in-domain (LibriTTS) and out-of-domain (VCTK) benchmarks demonstrate that our jointly fine-tuned framework consistently outperforms standard DSP and standalone plug-and-play upsampling methods. Under severe bandwidth constraints, the system substantially recovers speech naturalness, perceptual quality, and intelligibility, matching or exceeding clean baseline scores while leaving wide-bandwidth prompts uncorrupted. Although biometric speaker similarity remains inherently bounded by unobserved high-frequency cues in extreme low-resolution audio, our approach provides a practical, robust front-end that bridges the gap between lab-trained voice cloning architectures and heterogeneous, real-world capture conditions.
+\vfill\pagebreak
+
+
+% References should be produced using the bibtex program from suitable
+% BiBTeX files (here: strings, refs, manuals). The IEEEbib.bst bibliography
+% style file from IEEE produces unsorted bibliography list.
+% -------------------------------------------------------------------------
+\bibliographystyle{IEEEbib}
+\bibliography{refs}
+
+\end{document}

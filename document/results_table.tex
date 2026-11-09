@@ -1,0 +1,59 @@
+% Requires: \usepackage{booktabs,multirow,graphicx}
+\begin{table*}[t]
+\centering
+\caption{Prompt-bandwidth ladder. Every system synthesises 24\,kHz speech;
+only the sampling rate of the speech prompt changes, and the missing band is what the
+extender has to recover. $n=76$ utterances per cell. SIM-o is scored against the
+original, undegraded 24\,kHz prompt; WER is the Seed-TTS aggregation over
+Whisper-large-v3 transcripts; P.808 is DNSMOS; MCD is computed at 24\,kHz against
+a natural rendition of the target sentence. The 24\,kHz block is a null condition
+in which the extender is provably the identity. Best objective value per block in
+\textbf{bold}; subjective columns are left for the listening test.}
+\label{tab:main}
+\setlength{\tabcolsep}{3.5pt}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lc ccccc ccccc cc}
+\toprule
+\multirow{3}{*}{Model} & \multirow{3}{*}{Params} &
+\multicolumn{10}{c}{Objective Metrics} & \multicolumn{2}{c}{Subjective Metrics} \\
+\cmidrule(lr){3-12} \cmidrule(lr){13-14}
+& & \multicolumn{5}{c}{LibriTTS \textit{dev-clean}} & \multicolumn{5}{c}{VCTK 0.92} & & \\
+\cmidrule(lr){3-7} \cmidrule(lr){8-12}
+& (M) & SIM-o $\uparrow$ & WER $\downarrow$ & UTMOS $\uparrow$ & P.808 $\uparrow$ & MCD $\downarrow$
+& SIM-o $\uparrow$ & WER $\downarrow$ & UTMOS $\uparrow$ & P.808 $\uparrow$ & MCD $\downarrow$
+& CMOS $\uparrow$ & SMOS $\uparrow$ \\
+\midrule
+Natural speech & -- & 0.740 & 5.13 & 4.11 & 3.849 & -- & 0.726 & 1.11 & 4.06 & 3.748 & -- & 0 &  \\
+\midrule
+\multicolumn{14}{l}{\textit{Prompt sampled at 4\,kHz --- 10.0\,kHz of bandwidth missing}} \\
+ZipVoice (stock) & 122.7 & 0.368 & 3.40 & 2.80 & 3.210 & 19.30 & 0.322 & 1.11 & 2.96 & 3.094 & 18.10 &  &  \\
+\quad + extender, recon.-only (plug-and-play) & 130.1 & \textbf{0.379} & 3.62 & 3.13 & 3.297 & 15.76 & \textbf{0.352} & 1.88 & 3.22 & 3.217 & 15.61 &  &  \\
+\quad + extender (plug-and-play) & 130.1 & 0.377 & 4.09 & 3.87 & 3.600 & 10.20 & 0.317 & 1.19 & 3.91 & 3.577 & 10.03 &  &  \\
+\quad + extender, jointly fine-tuned & 130.1 & 0.374 & \textbf{2.59} & \textbf{4.27} & \textbf{3.940} & \textbf{9.94} & 0.310 & \textbf{0.62} & \textbf{4.27} & \textbf{3.795} & \textbf{9.46} &  &  \\
+\addlinespace
+\multicolumn{14}{l}{\textit{Prompt sampled at 8\,kHz --- 8.0\,kHz of bandwidth missing}} \\
+ZipVoice (stock) & 122.7 & \textbf{0.610} & 2.92 & 3.89 & 3.539 & 15.45 & \textbf{0.514} & 0.83 & 3.92 & 3.488 & 14.14 &  &  \\
+\quad + extender, recon.-only (plug-and-play) & 130.1 & 0.607 & 3.12 & 3.95 & 3.745 & 11.89 & \textbf{0.514} & \textbf{0.75} & 3.89 & 3.721 & 11.26 &  &  \\
+\quad + extender (plug-and-play) & 130.1 & 0.589 & 2.76 & 4.14 & 3.860 & 9.53 & 0.511 & 1.41 & 4.15 & 3.726 & 8.98 &  &  \\
+\quad + extender, jointly fine-tuned & 130.1 & 0.586 & \textbf{2.52} & \textbf{4.22} & \textbf{3.949} & \textbf{9.04} & 0.478 & 0.89 & \textbf{4.25} & \textbf{3.826} & \textbf{8.70} &  &  \\
+\addlinespace
+\multicolumn{14}{l}{\textit{Prompt sampled at 16\,kHz --- 4.0\,kHz of bandwidth missing}} \\
+ZipVoice (stock) & 122.7 & 0.730 & 2.76 & 4.08 & 3.969 & 10.95 & 0.622 & \textbf{0.76} & 4.08 & 3.886 & 11.18 &  &  \\
+\quad + extender, recon.-only (plug-and-play) & 130.1 & 0.696 & 3.37 & 4.13 & \textbf{3.987} & 10.34 & 0.573 & 2.16 & 4.16 & \textbf{3.895} & 10.17 &  &  \\
+\quad + extender (plug-and-play) & 130.1 & \textbf{0.736} & \textbf{2.55} & 4.14 & 3.965 & 8.57 & \textbf{0.632} & 1.07 & 4.17 & 3.852 & 8.95 &  &  \\
+\quad + extender, jointly fine-tuned & 130.1 & 0.722 & 3.24 & \textbf{4.19} & 3.937 & \textbf{8.02} & 0.615 & 0.98 & \textbf{4.18} & 3.825 & \textbf{8.18} &  &  \\
+\addlinespace
+\multicolumn{14}{l}{\textit{Prompt sampled at 22.05\,kHz --- 0.975\,kHz of bandwidth missing}} \\
+ZipVoice (stock) & 122.7 & \textbf{0.741} & 3.09 & \textbf{4.17} & 3.969 & 8.11 & 0.630 & 0.92 & 4.19 & \textbf{3.897} & 8.02 &  &  \\
+\quad + extender, recon.-only (plug-and-play) & 130.1 & 0.733 & 2.93 & \textbf{4.17} & 3.963 & 8.12 & 0.634 & 1.31 & \textbf{4.20} & 3.881 & 7.96 &  &  \\
+\quad + extender (plug-and-play) & 130.1 & 0.736 & \textbf{2.40} & \textbf{4.17} & \textbf{3.974} & 8.14 & \textbf{0.643} & 0.92 & 4.18 & 3.881 & 8.06 &  &  \\
+\quad + extender, jointly fine-tuned & 130.1 & 0.732 & 3.06 & \textbf{4.17} & 3.945 & \textbf{7.85} & 0.625 & \textbf{0.76} & 4.14 & 3.827 & \textbf{7.78} &  &  \\
+\addlinespace
+\multicolumn{14}{l}{\textit{Prompt sampled at 24\,kHz --- 0.0\,kHz of bandwidth missing}} \\
+ZipVoice (stock) & 122.7 & \textbf{0.739} & 2.99 & \textbf{4.20} & \textbf{3.984} & 7.90 & 0.621 & 1.15 & 4.17 & \textbf{3.919} & 7.79 &  &  \\
+\quad + extender, recon.-only (plug-and-play) & 130.1 & 0.731 & \textbf{2.43} & 4.15 & 3.964 & 7.88 & \textbf{0.626} & 0.95 & \textbf{4.23} & 3.882 & 7.70 &  &  \\
+\quad + extender (plug-and-play) & 130.1 & 0.731 & \textbf{2.43} & 4.15 & 3.964 & 7.88 & \textbf{0.626} & 0.95 & \textbf{4.23} & 3.882 & 7.70 &  &  \\
+\quad + extender, jointly fine-tuned & 130.1 & 0.729 & 2.65 & 4.16 & 3.949 & \textbf{7.77} & 0.622 & \textbf{0.76} & 4.18 & 3.850 & \textbf{7.67} &  &  \\
+\bottomrule
+\end{tabular}}
+\end{table*}
