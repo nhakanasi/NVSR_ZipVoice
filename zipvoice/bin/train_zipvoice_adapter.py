@@ -89,6 +89,7 @@ from zipvoice.models.modules.bwe_discriminators import (
     hinge_g_loss,
 )
 from zipvoice.models.modules.bwe import resample_band_limit, sample_cutoff
+from zipvoice.models.modules.dmd import DMDController
 from zipvoice.utils.feature import VocosFbank
 from zipvoice.models.modules.perceptual import SpeakerPerceptual
 from zipvoice.models.zipvoice import ZipVoice
@@ -453,8 +454,126 @@ def get_parser():
     )
 
     add_adapter_arguments(parser)
+    add_dmd_arguments(parser)
 
     return parser
+
+
+def add_dmd_arguments(parser: argparse.ArgumentParser) -> None:
+    """Distribution-matching distillation of the one-pass coupled student.
+
+    See ``zipvoice/models/modules/dmd.py``. Off unless --dmd-loss-weight > 0.
+    Needs --adapter-trainable lora (the student LoRA is what lets the backbone
+    learn to read its own branch's writes in a single pass) and runs on one GPU.
+    """
+    parser.add_argument(
+        "--dmd-loss-weight",
+        type=float,
+        default=0.0,
+        help="Weight of the DMD generator loss on the solved sample. 0 is off.",
+    )
+    parser.add_argument(
+        "--dmd-fm-weight",
+        type=float,
+        default=1.0,
+        help="Weight of the ordinary flow-matching + reconstruction loss while "
+        "DMD is on. It anchors the student to real data.",
+    )
+    parser.add_argument(
+        "--dmd-fake-rank",
+        type=int,
+        default=64,
+        help="LoRA rank of the fake score on the decoder.",
+    )
+    parser.add_argument(
+        "--dmd-fake-lr",
+        type=float,
+        default=1e-4,
+        help="AdamW learning rate of the fake score.",
+    )
+    parser.add_argument(
+        "--dmd-start-step",
+        type=int,
+        default=1000,
+        help="Batches of fake-score-only updates before the generator loss "
+        "starts. The fake score starts as the teacher, so before it has fitted "
+        "the student the only generator signal is the guidance direction.",
+    )
+    parser.add_argument(
+        "--dmd-gen-interval",
+        type=int,
+        default=5,
+        help="Generator update every N batches (DMD2's two time-scale rule); "
+        "the fake score updates every batch.",
+    )
+    parser.add_argument(
+        "--dmd-num-step",
+        type=int,
+        default=16,
+        help="Solver steps of the student rollout. Train at the step count you "
+        "deploy at.",
+    )
+    parser.add_argument(
+        "--dmd-guidance",
+        type=float,
+        default=1.0,
+        help="Guidance scale of the student rollout, i.e. the deployed one.",
+    )
+    parser.add_argument(
+        "--dmd-real-guidance",
+        type=float,
+        default=1.0,
+        help="Guidance scale of the clean-prompt teacher score.",
+    )
+    parser.add_argument(
+        "--dmd-t-shift",
+        type=float,
+        default=0.5,
+        help="t_shift of the student rollout, i.e. the deployed one.",
+    )
+    parser.add_argument(
+        "--dmd-grad-steps",
+        type=int,
+        default=1,
+        help="Solver steps at the end of the rollout that carry a graph. Each "
+        "costs one guided backbone forward's activations.",
+    )
+    parser.add_argument(
+        "--dmd-t-min",
+        type=float,
+        default=0.02,
+        help="Lower end of the noise level the sample is re-noised at.",
+    )
+    parser.add_argument(
+        "--dmd-t-max",
+        type=float,
+        default=0.98,
+        help="Upper end of the noise level the sample is re-noised at.",
+    )
+    parser.add_argument(
+        "--dmd-utts",
+        type=int,
+        default=1,
+        help="Utterances per DMD rollout.",
+    )
+    parser.add_argument(
+        "--dmd-max-seconds",
+        type=float,
+        default=8.0,
+        help="Only utterances up to this long are rolled out (0 = no cap).",
+    )
+    parser.add_argument(
+        "--dmd-cutoffs",
+        type=str,
+        default="4000,8000",
+        help="Comma-separated prompt cutoffs in Hz, one drawn per utterance.",
+    )
+    parser.add_argument(
+        "--dmd-prompt-frac",
+        type=str,
+        default="0.2,0.5",
+        help="Range of the prompt's share of the utterance, as lo,hi.",
+    )
 
 
 def add_adapter_arguments(parser: argparse.ArgumentParser) -> None:
@@ -1262,6 +1381,20 @@ def discriminator_states(
     }
 
 
+def checkpoint_extra_states(
+    discriminators: Optional[Union[nn.Module, DDP]],
+    disc_optimizer: Optional[Optimizer],
+    dmd: Optional[DMDController] = None,
+) -> Optional[dict]:
+    """Everything trained outside the model: discriminators and the DMD fake
+    score. Both stay out of the model's state dict so the checkpoint still loads
+    as an ordinary ``ZipVoiceAdapter``."""
+    states = discriminator_states(discriminators, disc_optimizer) or {}
+    if dmd is not None:
+        states["dmd"] = dmd.state_dict()
+    return states or None
+
+
 def run_discriminators(
     discriminators: Union[nn.Module, DDP],
     mel: Tensor,
@@ -1907,6 +2040,7 @@ def train_one_epoch(
     perceptual: Optional[nn.Module] = None,
     fbank: Optional[nn.Module] = None,
     teacher: Optional[nn.Module] = None,
+    dmd: Optional[DMDController] = None,
 ) -> None:
     """Train the model for one epoch.
 
@@ -1958,7 +2092,7 @@ def train_one_epoch(
             sampler=train_dl.sampler,
             scaler=scaler,
             rank=0,
-            extra_states=discriminator_states(discriminators, disc_optimizer),
+            extra_states=checkpoint_extra_states(discriminators, disc_optimizer, dmd),
         )
 
     for batch_idx, batch in enumerate(train_dl):
@@ -2044,6 +2178,29 @@ def train_one_epoch(
                     fbank=fbank,
                 )
 
+                if dmd is not None:
+                    # The generator term on the solved sample. The ordinary
+                    # flow-matching loss stays on, at --dmd-fm-weight, as the
+                    # anchor to real data. Off-schedule batches return None and
+                    # train exactly as before.
+                    dmd_loss, dmd_stats = dmd.generator_loss(
+                        model,
+                        step=params.batch_idx_train,
+                        tokens=tokens,
+                        features=features,
+                        features_lens=features_lens,
+                        audio=audio,
+                        audio_lens=audio_lens,
+                        fbank=fbank,
+                    )
+                    loss = params.dmd_fm_weight * loss
+                    if dmd_loss is not None:
+                        loss = loss + dmd_loss
+                        frames = dmd_stats.pop("frames")
+                        loss_info["dmd_frames"] = frames
+                        for name, value in dmd_stats.items():
+                            loss_info[f"dmd_{name}"] = value * frames
+
                 train_disc = ctx is not None
                 if train_disc:
                     disc_loss, disc_info = compute_disc_loss(
@@ -2106,6 +2263,30 @@ def train_one_epoch(
                 optimizer.zero_grad(set_to_none=True)
                 if train_disc:
                     disc_optimizer.zero_grad(set_to_none=True)
+
+            if dmd is not None:
+                # After the student's step, so the fake score is fitted to the
+                # student as it now is. Its own optimiser and scaler; its loss
+                # reaches only the fake LoRA.
+                fake_info = dmd.fake_update(
+                    model,
+                    tokens=tokens,
+                    features=features,
+                    features_lens=features_lens,
+                    audio=audio,
+                    audio_lens=audio_lens,
+                    fbank=fbank,
+                    autocast=partial(
+                        torch_autocast, dtype=torch.float16, enabled=params.use_fp16
+                    ),
+                )
+                fake_metrics = MetricsTracker()
+                fake_metrics["dmdfake_frames"] = fake_info["fake_frames"]
+                fake_metrics["dmdfake_loss"] = (
+                    fake_info["fake_loss"] * fake_info["fake_frames"]
+                )
+                loss_info = loss_info + fake_metrics
+                tot_loss = tot_loss + fake_metrics
         except Exception as e:
             logging.info(f"Caught exception : {e}.")
             save_bad_model()
@@ -2140,7 +2321,7 @@ def train_one_epoch(
                 sampler=train_dl.sampler,
                 scaler=scaler,
                 rank=rank,
-                extra_states=discriminator_states(discriminators, disc_optimizer),
+                extra_states=checkpoint_extra_states(discriminators, disc_optimizer, dmd),
             )
             remove_checkpoints(
                 out_dir=params.exp_dir,
@@ -2750,6 +2931,60 @@ def run(rank, world_size, args):
 
     scaler = create_grad_scaler(enabled=params.use_fp16)
 
+    dmd: Optional[DMDController] = None
+    if params.dmd_loss_weight > 0.0:
+        inner = model.module if isinstance(model, DDP) else model
+        assert world_size == 1, (
+            "DMD calls the model outside DDP's forward and runs on one GPU"
+        )
+        assert params.adapter_trainable == "lora", (
+            "The one-pass DMD student needs --adapter-trainable lora: without "
+            "the decoder LoRA nothing can learn to read the branch's writes"
+        )
+        assert params.identity_rollout_prob <= 0.0, (
+            "DMD and the identity rollout are alternative generator losses"
+        )
+        assert inner.pretrained_spk_proj is None, (
+            "DMD does not pass speaker embeddings"
+        )
+        dmd = DMDController(
+            inner,
+            rank=params.dmd_fake_rank,
+            lr=params.dmd_fake_lr,
+            loss_weight=params.dmd_loss_weight,
+            start_step=params.dmd_start_step,
+            gen_interval=params.dmd_gen_interval,
+            num_step=params.dmd_num_step,
+            guidance_scale=params.dmd_guidance,
+            real_guidance=params.dmd_real_guidance,
+            t_shift=params.dmd_t_shift,
+            grad_steps=params.dmd_grad_steps,
+            t_min=params.dmd_t_min,
+            t_max=params.dmd_t_max,
+            num_utts=params.dmd_utts,
+            max_frames=(
+                int(round(params.dmd_max_seconds / VocosFbank().frame_shift))
+                if params.dmd_max_seconds > 0
+                else 0
+            ),
+            cutoffs=[float(c) for c in params.dmd_cutoffs.split(",") if c.strip()],
+            prompt_frac=tuple(float(v) for v in params.dmd_prompt_frac.split(",")),
+            feat_scale=params.feat_scale,
+            sampling_rate=params.sampling_rate,
+            use_fp16=params.use_fp16,
+        )
+        if checkpoints is not None and checkpoints.get("dmd") is not None:
+            logging.info("Loading the DMD fake score")
+            dmd.load_state_dict(checkpoints["dmd"])
+        logging.info(
+            f"DMD on: weight {params.dmd_loss_weight}, fake LoRA rank "
+            f"{params.dmd_fake_rank} ({sum(p.numel() for p in dmd.fake.parameters())} "
+            f"parameters), generator every {params.dmd_gen_interval} batches from "
+            f"batch {params.dmd_start_step}, {params.dmd_num_step}-step rollout at "
+            f"guidance {params.dmd_guidance}, teacher guidance "
+            f"{params.dmd_real_guidance}, cutoffs {params.dmd_cutoffs}"
+        )
+
     if checkpoints is not None:
         # load state_dict for optimizers
         if "optimizer" in checkpoints:
@@ -2902,6 +3137,7 @@ def run(rank, world_size, args):
             perceptual=perceptual,
             teacher=teacher,
             fbank=fbank,
+            dmd=dmd,
         )
 
         if params.num_iters > 0 and params.batch_idx_train > params.num_iters:
@@ -2922,7 +3158,7 @@ def run(rank, world_size, args):
             sampler=train_dl.sampler,
             scaler=scaler,
             rank=rank,
-            extra_states=discriminator_states(discriminators, disc_optimizer),
+            extra_states=checkpoint_extra_states(discriminators, disc_optimizer, dmd),
         )
 
         if rank == 0:

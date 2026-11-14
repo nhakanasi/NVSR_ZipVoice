@@ -130,7 +130,7 @@ class MetricsTracker(collections.defaultdict):
         # missing key would insert it while ``norm_items`` iterates.
         if "utt_" in key:
             return self.get("utterances", 0) or 1
-        if key.startswith("rollout"):
+        if key.startswith(("rollout", "dmd")):
             # ``rollout4k_high_loss`` is over ``rollout4k_frames``: a subset of
             # rollout batches keeps its own count.
             return self.get(key.split("_")[0] + "_frames", 0) or 1
